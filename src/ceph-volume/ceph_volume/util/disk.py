@@ -1018,9 +1018,14 @@ def get_devices(_sys_block_path='/sys/block', device=''):
         metadata['type'] = block[2]
         metadata['parent'] = block[3]
 
-        # some facts from udevadm
-        udev_data = UdevData(sysdir)
-        metadata['id_bus'] = udev_data.environment.get("ID_BUS", "")
+        # some facts from udevadm; /run/udev/data may not be populated yet
+        # for a freshly created device (before udev settles), missing udev
+        # data must not exclude the device from the report
+        try:
+            metadata['id_bus'] = UdevData(sysdir).environment.get("ID_BUS", "")
+        except RuntimeError as exc:
+            logger.debug('get_devices(): no udev data for %s: %s', diskname, exc)
+            metadata['id_bus'] = ''
 
         device_facts[diskname] = metadata
     return device_facts

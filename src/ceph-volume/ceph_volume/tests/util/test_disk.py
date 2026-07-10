@@ -510,6 +510,31 @@ class TestGetDevices(object):
         assert result[nvme_path]['model'] == 'SSD 990 PRO'
         assert result[nvme_path]['rev'] == '1B2Q'
 
+    def test_device_with_missing_udev_data_is_reported(
+        self, patched_get_block_devs_sysfs, fake_filesystem
+    ):
+        # https://tracker.ceph.com/issues/77968
+        sdb_path = '/dev/sdb'
+        patched_get_block_devs_sysfs.return_value = [[sdb_path, sdb_path, 'disk', sdb_path]]
+        fake_filesystem.create_dir('/sys/block/sdb/slaves')
+        fake_filesystem.create_dir('/sys/block/sdb/queue')
+        fake_filesystem.create_file('/sys/block/sdb/dev', contents='8:16')
+        result = disk.get_devices()
+        assert list(result.keys()) == [sdb_path]
+        assert result[sdb_path]['id_bus'] == ''
+
+    def test_id_bus_is_read_from_udev_data(
+        self, patched_get_block_devs_sysfs, fake_filesystem
+    ):
+        sdb_path = '/dev/sdb'
+        patched_get_block_devs_sysfs.return_value = [[sdb_path, sdb_path, 'disk', sdb_path]]
+        fake_filesystem.create_dir('/sys/block/sdb/slaves')
+        fake_filesystem.create_dir('/sys/block/sdb/queue')
+        fake_filesystem.create_file('/sys/block/sdb/dev', contents='8:16')
+        fake_filesystem.create_file('/run/udev/data/b8:16', contents='E:ID_BUS=ata')
+        result = disk.get_devices()
+        assert result[sdb_path]['id_bus'] == 'ata'
+
 
 class TestGetBlockDevsSysfs(object):
     def test_optical_device_is_skipped(self, fake_filesystem):
