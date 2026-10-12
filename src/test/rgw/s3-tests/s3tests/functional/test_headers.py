@@ -10,6 +10,10 @@ from botocore.credentials import Credentials
 from botocore.exceptions import ClientError
 
 from email.utils import formatdate
+import http.client
+from urllib.parse import urlsplit
+from botocore.auth import HmacV1Auth
+from botocore.auth import HmacV1QueryAuth
 
 from .utils import assert_raises
 from .utils import _get_status_and_error_code
@@ -815,3 +819,163 @@ def test_sigv4_presigned_good():
     signer.add_auth(req)
     resp = requests.get(req.url)
     assert(resp.status_code == 200)
+
+
+# ---------------------------------------------------------------------------
+# X38: a signed request moved into an absolute-form request target must not be
+# served as a different operation than the one it was signed for.
+#
+# The operation, bucket and key are derived from the request target, and a
+# signature covers the path and query the server splits from that target. If a
+# server takes the path from an absolute-form target's *query* instead of its
+# path, a request signed for GetObject on bucket/key can be served as
+# ListBuckets / GetBucketPolicy / GetObjectAcl / GetObjectTagging / GetUsage --
+# a signature minted for one op replayed as another.
+#
+# These tests send the target verbatim with http.client (requests rewrites an
+# absolute-form target to origin-form) and assert the security PROPERTY, not a
+# status code: the response is an error, or it is the signed object's own body;
+# it is never a listing, ACL, tagging, policy, location or usage document.
+# ---------------------------------------------------------------------------
+
+_X38_CANARY = b'x38-canary-object-body'
+
+# Root elements / markers of the "other op" documents a re-target could select.
+_X38_OTHER_OP_MARKERS = [
+    b'<ListAllMyBucketsResult',   # ListBuckets
+    b'<ListBucketResult',         # ListObjects
+    b'<AccessControlPolicy',      # Get{Object,Bucket}Acl
+    b'<Tagging',                  # Get{Object,Bucket}Tagging
+    b'<Usage',                    # GetUsage (admin)
+    b'<LocationConstraint',       # GetBucketLocation
+    b'"Statement"',               # GetBucketPolicy (JSON)
+]
+
+
+def _x38_host_port():
+    parts = urlsplit(get_config_endpoint())
+    return parts.scheme, parts.hostname, (parts.port or (443 if parts.scheme == 'https' else 80))
+
+
+def _x38_make_object():
+    """Create a bucket + object with a distinctive canary body. Returns (bucket, key)."""
+    bucket = get_new_bucket()
+    client = get_client()
+    key = 'x38/target'
+    client.put_object(Bucket=bucket, Key=key, Body=_X38_CANARY)
+    return bucket, key
+
+
+def _x38_sigv4_presigned(bucket, key):
+    signer = _get_s3sigv4_query_signer()
+    req = AWSRequest(method='GET', url=get_config_endpoint() + '/' + bucket + '/' + key)
+    signer.add_auth(req)
+    return urlsplit(req.url).query, {}
+
+
+def _x38_sigv4_header(bucket, key):
+    signer = _get_s3sigv4_signer()
+    req = AWSRequest(method='GET', url=get_config_endpoint() + '/' + bucket + '/' + key)
+    signer.add_auth(req)
+    return '', dict(req.headers)
+
+
+def _x38_sigv2_presigned(bucket, key):
+    creds = Credentials(access_key=get_main_aws_access_key(), secret_key=get_main_aws_secret_key())
+    signer = HmacV1QueryAuth(credentials=creds, expires=100000)
+    req = AWSRequest(method='GET', url=get_config_endpoint() + '/' + bucket + '/' + key)
+    signer.add_auth(req)
+    return urlsplit(req.url).query, {}
+
+
+def _x38_sigv2_header(bucket, key):
+    creds = Credentials(access_key=get_main_aws_access_key(), secret_key=get_main_aws_secret_key())
+    signer = HmacV1Auth(credentials=creds)
+    req = AWSRequest(method='GET', url=get_config_endpoint() + '/' + bucket + '/' + key)
+    signer.add_auth(req)
+    return '', dict(req.headers)
+
+
+_X38_FORMS = {
+    'sigv4_presigned': _x38_sigv4_presigned,
+    'sigv2_presigned': _x38_sigv2_presigned,
+    'sigv4_header': _x38_sigv4_header,
+    'sigv2_header': _x38_sigv2_header,
+}
+
+
+def _x38_send(target, headers):
+    """Send GET <target> verbatim (absolute-form) and return (status, body)."""
+    scheme, host, port = _x38_host_port()
+    if scheme == 'https':
+        import ssl
+        ctx = None if get_config_ssl_verify() else ssl._create_unverified_context()
+        conn = http.client.HTTPSConnection(host, port, context=ctx)
+    else:
+        conn = http.client.HTTPConnection(host, port)
+    try:
+        conn.putrequest('GET', target, skip_host=True, skip_accept_encoding=True)
+        conn.putheader('Host', host)
+        for k, v in headers.items():
+            if k.lower() == 'host':
+                continue
+            conn.putheader(k, v)
+        conn.endheaders()
+        resp = conn.getresponse()
+        return resp.status, resp.read()
+    finally:
+        conn.close()
+
+
+def _x38_assert_property(status, body):
+    """Error, or the signed object's own body -- never another op's document."""
+    if status >= 400:
+        return
+    for marker in _X38_OTHER_OP_MARKERS:
+        assert marker not in body, \
+            f'retarget served a different-op document (status {status}, marker {marker!r}): {body[:200]!r}'
+    assert body == _X38_CANARY, \
+        f'retarget served a non-error, non-object body (status {status}): {body[:200]!r}'
+
+
+@pytest.mark.auth_common
+@pytest.mark.parametrize('form', list(_X38_FORMS))
+@pytest.mark.parametrize('lead', ['acl', 'policy', 'tagging', 'versioning', 'usage'])
+def test_x38_retarget_path_in_query_after_subresource(form, lead):
+    # The signed path /bucket/key is hidden in the query behind an unsigned
+    # sub-resource that would otherwise select a different op.
+    bucket, key = _x38_make_object()
+    _, host, _ = _x38_host_port()
+    query, headers = _X38_FORMS[form](bucket, key)
+    sep = '?' if query else ''
+    target = 'http://%s?%s&x/%s/%s%s%s' % (host, lead, bucket, key, sep, query)
+    status, body = _x38_send(target, headers)
+    _x38_assert_property(status, body)
+
+
+@pytest.mark.auth_common
+@pytest.mark.parametrize('form', list(_X38_FORMS))
+def test_x38_retarget_path_in_query_bare(form):
+    # Path in the query with no leading sub-resource; read as an empty path it
+    # would select ListBuckets.
+    bucket, key = _x38_make_object()
+    _, host, _ = _x38_host_port()
+    query, headers = _X38_FORMS[form](bucket, key)
+    sep = '?' if query else ''
+    target = 'http://%s?/%s/%s%s%s' % (host, bucket, key, sep, query)
+    status, body = _x38_send(target, headers)
+    _x38_assert_property(status, body)
+
+
+@pytest.mark.auth_common
+@pytest.mark.parametrize('form', list(_X38_FORMS))
+def test_x38_retarget_bad_percent_escape_in_path(form):
+    # A malformed percent-escape in the query-hidden path must not be
+    # emptied/truncated into a different op.
+    bucket, key = _x38_make_object()
+    _, host, _ = _x38_host_port()
+    query, headers = _X38_FORMS[form](bucket, key)
+    sep = '?' if query else ''
+    target = 'http://%s?x/%s/%s%%zz%s%s' % (host, bucket, key, sep, query)
+    status, body = _x38_send(target, headers)
+    _x38_assert_property(status, body)
