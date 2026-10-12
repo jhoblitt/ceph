@@ -1684,6 +1684,36 @@ def test_bucket_concurrent_set_canned_acl():
     for r in results:
         assert r == True
 
+    # every call set the same acl, so the bucket holds it whichever write
+    # landed last
+    response = client.get_bucket_acl(Bucket=bucket_name)
+
+    display_name = get_main_display_name()
+    user_id = get_main_user_id()
+
+    grants = response['Grants']
+    check_grants(
+        grants,
+        [
+            dict(
+                Permission='READ',
+                ID=None,
+                DisplayName=None,
+                URI='http://acs.amazonaws.com/groups/global/AllUsers',
+                EmailAddress=None,
+                Type='Group',
+                ),
+            dict(
+                Permission='FULL_CONTROL',
+                ID=user_id,
+                DisplayName=display_name,
+                URI=None,
+                EmailAddress=None,
+                Type='CanonicalUser',
+                ),
+            ],
+        )
+
 def test_object_write_to_nonexist_bucket():
     key_names = ['foo']
     bucket_name = 'whatchutalkinboutwillis'
