@@ -212,9 +212,28 @@ def test_object_create_bad_md5_none():
     client = get_client()
     client.put_object(Bucket=bucket_name, Key=key_name, Body='bar')
 
+def _call_with_unknown_expectation(func, **kwargs):
+    """ Call func, whose request carries an Expect other than 100-continue.
+    RFC 9110 section 10.1.1 lets a server answer such an expectation with
+    417 (Expectation Failed), so accept that as well as success
+    """
+    try:
+        func(**kwargs)
+    except ClientError as e:
+        if _get_status(e.response) != 417:
+            raise
+
 @pytest.mark.auth_common
 def test_object_create_bad_expect_mismatch():
-    bucket_name, key_name = _add_header_create_object({'Expect': 200})
+    bucket_name = get_new_bucket()
+    client = get_client()
+    key_name = 'foo'
+
+    headers = {'Expect': 200}
+    add_headers = (lambda **kwargs: kwargs['params']['headers'].update(headers))
+    client.meta.events.register('before-call.s3.PutObject', add_headers)
+    _call_with_unknown_expectation(client.put_object, Bucket=bucket_name, Key=key_name)
+
     client = get_client()
     client.put_object(Bucket=bucket_name, Key=key_name, Body='bar')
 
@@ -362,7 +381,7 @@ def test_bucket_create_bad_expect_mismatch():
     headers = {'Expect': 200}
     add_headers = (lambda **kwargs: kwargs['params']['headers'].update(headers))
     client.meta.events.register('before-call.s3.CreateBucket', add_headers)
-    client.create_bucket(Bucket=bucket_name)
+    _call_with_unknown_expectation(client.create_bucket, Bucket=bucket_name)
 
 @pytest.mark.auth_common
 def test_bucket_create_bad_expect_empty():
