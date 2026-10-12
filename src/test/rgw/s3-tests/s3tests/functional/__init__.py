@@ -96,19 +96,58 @@ def list_versions(client, bucket, batch_size):
         if len(objs):
             yield [{'Key': o['Key'], 'VersionId': o['VersionId']} for o in objs]
 
+# like list_versions(), for a bucket that never had versioning: each batch
+# names its objects by key alone
+def list_keys(client, bucket, batch_size):
+    kwargs = {'Bucket': bucket, 'MaxKeys': batch_size}
+    truncated = True
+    while truncated:
+        listing = client.list_objects(**kwargs)
+        objs = listing.get('Contents', [])
+        if not objs:
+            break
+        kwargs['Marker'] = objs[-1]['Key']
+        truncated = listing['IsTruncated']
+        yield [{'Key': o['Key']} for o in objs]
+
+def bucket_had_versioning(client, bucket):
+    """
+    Whether versioning was ever set on the bucket, which then reports a
+    Status. A gateway that answers 501 Not Implemented has no versioning, so
+    its buckets never had it. Any other error leaves it unknown, and the
+    bucket is treated as one that had versioning.
+    """
+    try:
+        response = client.get_bucket_versioning(Bucket=bucket)
+    except ClientError as e:
+        return e.response['ResponseMetadata']['HTTPStatusCode'] != 501
+    return 'Status' in response
+
 def nuke_bucket(client, bucket):
     batch_size = 128
     max_retain_date = None
 
+    # a bucket that never had versioning holds no versions to name, and no
+    # object locks, which need versioning
+    versioned = bucket_had_versioning(client, bucket)
+    if versioned:
+        listing = list_versions(client, bucket, batch_size)
+    else:
+        listing = list_keys(client, bucket, batch_size)
+
     # list and delete objects in batches
-    for objects in list_versions(client, bucket, batch_size):
-        delete = client.delete_objects(Bucket=bucket,
-                Delete={'Objects': objects, 'Quiet': True},
-                BypassGovernanceRetention=True)
+    for objects in listing:
+        if versioned:
+            delete = client.delete_objects(Bucket=bucket,
+                    Delete={'Objects': objects, 'Quiet': True},
+                    BypassGovernanceRetention=True)
+        else:
+            delete = client.delete_objects(Bucket=bucket,
+                    Delete={'Objects': objects, 'Quiet': True})
 
         # check for object locks on 403 AccessDenied errors
         for err in delete.get('Errors', []):
-            if err.get('Code') != 'AccessDenied':
+            if not versioned or err.get('Code') != 'AccessDenied':
                 continue
             try:
                 res = client.get_object_retention(Bucket=bucket,
