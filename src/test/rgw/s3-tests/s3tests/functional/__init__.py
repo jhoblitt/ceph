@@ -14,6 +14,7 @@ import string
 import itertools
 import urllib3
 import re
+import warnings
 
 config = munch.Munch
 
@@ -305,19 +306,40 @@ def configure():
     else:
         config.cloud_storage_class = None
 
+# buckets that setup() failed to remove. the test that left each one behind
+# already failed in its teardown() over it, so no later test fails over it
+leftover_buckets = set()
+
+def nuke_test_buckets(client, in_setup):
+    """
+    Remove the buckets under the run's prefix that client lists. Every bucket
+    is tried before any error is raised. A bucket that setup cannot remove is
+    recorded in leftover_buckets with a warning, and teardown raises only for
+    a bucket that is not recorded there.
+    """
+    err = None
+    for bucket_name in get_buckets_list(client, prefix):
+        try:
+            nuke_bucket(client, bucket_name)
+        except Exception as e:
+            if bucket_name in leftover_buckets:
+                continue
+            if in_setup:
+                warnings.warn('cannot remove bucket {} left behind by an '
+                              'earlier test: {}'.format(bucket_name, e))
+                leftover_buckets.add(bucket_name)
+            else:
+                err = e
+    if err:
+        raise err
+
 def setup():
-    alt_client = get_alt_client()
-    tenant_client = get_tenant_client()
-    nuke_prefixed_buckets(prefix=prefix)
-    nuke_prefixed_buckets(prefix=prefix, client=alt_client)
-    nuke_prefixed_buckets(prefix=prefix, client=tenant_client)
+    for client in (get_client(), get_alt_client(), get_tenant_client()):
+        nuke_test_buckets(client, in_setup=True)
 
 def teardown():
-    alt_client = get_alt_client()
-    tenant_client = get_tenant_client()
-    nuke_prefixed_buckets(prefix=prefix)
-    nuke_prefixed_buckets(prefix=prefix, client=alt_client)
-    nuke_prefixed_buckets(prefix=prefix, client=tenant_client)
+    for client in (get_client(), get_alt_client(), get_tenant_client()):
+        nuke_test_buckets(client, in_setup=False)
     try:
         iam_client = get_iam_client()
         list_roles_resp = iam_client.list_roles()
