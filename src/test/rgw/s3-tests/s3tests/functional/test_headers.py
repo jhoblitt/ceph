@@ -820,6 +820,28 @@ def test_sigv4_presigned_good():
     resp = requests.get(req.url)
     assert(resp.status_code == 200)
 
+@pytest.mark.auth_aws4
+def test_sigv4_presigned_put_xgoog_meta_unsigned():
+    # RGW files an X-Goog- header under its x-amz- name, so an unsigned
+    # X-Goog-Meta-Foo on a presigned PUT would store user metadata the URL's
+    # signer never named. It has to be refused like an unsigned x-amz- header.
+    bucket = get_new_bucket()
+    key = 'foo'
+    signer = _get_s3sigv4_query_signer()
+    req = AWSRequest(method="PUT", url=get_config_endpoint() + "/" + bucket + "/" + key)
+    signer.add_auth(req)
+    resp = requests.put(req.url, data=b'bar', headers={'X-Goog-Meta-Foo': 'evil-header'},
+                        verify=get_config_ssl_verify())
+    assert(resp.status_code == 403)
+    client = get_client()
+    e = assert_raises(ClientError, client.head_object, Bucket=bucket, Key=key)
+    assert(_get_status(e.response) == 404)
+
+    # the same URL without the unsigned header is accepted
+    resp = requests.put(req.url, data=b'bar', verify=get_config_ssl_verify())
+    assert(resp.status_code == 200)
+    assert(client.head_object(Bucket=bucket, Key=key)['Metadata'] == {})
+
 
 # ---------------------------------------------------------------------------
 # X38: a signed request moved into an absolute-form request target must not be
