@@ -16478,9 +16478,11 @@ def _has_target_object_key_format():
         })
     except ParamValidationError as e:
         return False
-    finally:
+    except ClientError as e:
         # should fail on non-existing bucket
         return True
+
+    return True
 
 
 import shlex
