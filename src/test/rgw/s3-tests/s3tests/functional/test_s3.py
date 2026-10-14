@@ -6564,6 +6564,27 @@ def test_multipart_upload_resend_part():
     _check_upload_multipart_resend(bucket_name, key, objlen, [1,2])
     _check_upload_multipart_resend(bucket_name, key, objlen, [0,1,2,3,4,5])
 
+@pytest.mark.fails_on_dbstore
+def test_multipart_upload_resend_complete():
+    bucket_name = get_new_bucket()
+    key="mymultipart"
+    objlen = 10 * 1024 * 1024
+    client = get_client()
+
+    (upload_id, data, parts) = _multipart_upload(bucket_name=bucket_name, key=key, size=objlen)
+    response = client.complete_multipart_upload(Bucket=bucket_name, Key=key, UploadId=upload_id, MultipartUpload={'Parts': parts})
+    etag = response['ETag']
+    assert etag.strip('"') != ''
+
+    # a client that lost the first response sends the same completion again
+    response = client.complete_multipart_upload(Bucket=bucket_name, Key=key, UploadId=upload_id, MultipartUpload={'Parts': parts})
+    assert response['ResponseMetadata']['HTTPStatusCode'] == 200
+    assert response['ETag'] == etag
+
+    response = client.head_object(Bucket=bucket_name, Key=key)
+    assert response['ETag'] == etag
+    assert response['ContentLength'] == objlen
+
 def test_multipart_upload_multiple_sizes():
     bucket_name = get_new_bucket()
     key="mymultipart"
