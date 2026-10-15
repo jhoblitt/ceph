@@ -1739,6 +1739,32 @@ def test_object_write_with_chunked_transfer_encoding():
     assert response['ResponseMetadata']['HTTPStatusCode'] == 200
 
 
+def test_object_write_bad_part_number():
+    # RGW reads partNumber on every PutObject, with or without an uploadId,
+    # and refuses one strict_strtol cannot parse. A number it parses without
+    # an uploadId is not a part, and the object is stored.
+    bucket_name = get_new_bucket()
+    client = get_client()
+
+    part_number = 'x'
+    def add_part_number(**kwargs):
+        sep = '&' if '?' in kwargs['params']['url'] else '?'
+        kwargs['params']['url'] += sep + 'partNumber=' + part_number
+    client.meta.events.register('before-call.s3.PutObject', add_part_number)
+
+    e = assert_raises(ClientError, client.put_object, Bucket=bucket_name, Key='foo', Body='bar')
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 400
+    assert error_code == 'InvalidArgument'
+    e = assert_raises(ClientError, client.head_object, Bucket=bucket_name, Key='foo')
+    assert _get_status(e.response) == 404
+
+    part_number = '1'
+    client.put_object(Bucket=bucket_name, Key='foo', Body='bar')
+    response = client.get_object(Bucket=bucket_name, Key='foo')
+    assert _get_body(response) == 'bar'
+
+
 def test_bucket_create_delete():
     bucket_name = get_new_bucket()
     client = get_client()
