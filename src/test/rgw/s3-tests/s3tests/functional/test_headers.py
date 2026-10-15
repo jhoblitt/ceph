@@ -842,6 +842,32 @@ def test_sigv4_presigned_put_xgoog_meta_unsigned():
     assert(resp.status_code == 200)
     assert(client.head_object(Bucket=bucket, Key=key)['Metadata'] == {})
 
+@pytest.mark.auth_aws2
+def test_sigv2_signed_copy_source_moved_to_xgoog():
+    # The SigV2 string to sign names an X-Goog- header by its x-amz- name,
+    # but RGW reads the copy source from X-Amz-Copy-Source alone. So a signed
+    # X-Amz-Copy-Source resent as X-Goog-Copy-Source keeps its signature and
+    # drops the copy, turning the CopyObject into a PutObject of the empty
+    # body. It has to be refused.
+    bucket = get_new_bucket()
+    client = get_client()
+    client.put_object(Bucket=bucket, Key='src', Body=b'source')
+    creds = Credentials(access_key=get_main_aws_access_key(), secret_key=get_main_aws_secret_key())
+    req = AWSRequest(method='PUT', url=get_config_endpoint() + '/' + bucket + '/dst',
+                     headers={'X-Amz-Copy-Source': bucket + '/src'})
+    HmacV1Auth(credentials=creds).add_auth(req)
+    moved = dict(req.headers)
+    moved['X-Goog-Copy-Source'] = moved.pop('X-Amz-Copy-Source')
+    resp = requests.put(req.url, headers=moved, verify=get_config_ssl_verify())
+    assert(resp.status_code == 403)
+    e = assert_raises(ClientError, client.head_object, Bucket=bucket, Key='dst')
+    assert(_get_status(e.response) == 404)
+
+    # the same signature with the header as signed copies the source
+    resp = requests.put(req.url, headers=dict(req.headers), verify=get_config_ssl_verify())
+    assert(resp.status_code == 200)
+    assert(client.get_object(Bucket=bucket, Key='dst')['Body'].read() == b'source')
+
 
 # ---------------------------------------------------------------------------
 # X38: a signed request moved into an absolute-form request target must not be
