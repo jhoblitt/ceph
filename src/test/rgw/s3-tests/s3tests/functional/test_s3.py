@@ -15265,6 +15265,55 @@ def test_get_fixed_source_ip_bucket_policy_status():
     assert resp['PolicyStatus']['IsPublic'] == False
 
 
+# RGW reads arn:aws:iam:::root as the account of the default tenant, which
+# holds the user that unauthenticated requests run as, so a grant to it
+# grants every unauthenticated request: it is public.
+_anonymous_root_principal = {"AWS": "arn:aws:iam:::root"}
+
+
+def test_block_public_anonymous_root_principal():
+    bucket_name = get_new_bucket()
+    client = get_client()
+
+    access_conf = {'BlockPublicAcls': False,
+                   'IgnorePublicAcls': False,
+                   'BlockPublicPolicy': True,
+                   'RestrictPublicBuckets': False}
+
+    client.put_public_access_block(Bucket=bucket_name, PublicAccessBlockConfiguration=access_conf)
+    resource = _make_arn_resource("{}/{}".format(bucket_name, "*"))
+    policy_document = make_json_policy("s3:GetObject", resource, principal=_anonymous_root_principal)
+
+    check_access_denied(client.put_bucket_policy, Bucket=bucket_name, Policy=policy_document)
+
+
+@pytest.mark.fails_on_dbstore
+def test_restrict_public_anonymous_root_principal():
+    bucket_name = get_new_bucket()
+    client = get_client()
+
+    client.put_object(Bucket=bucket_name, Key='foo', Body='bar')
+    resource = _make_arn_resource("{}/{}".format(bucket_name, "*"))
+    policy_document = make_json_policy("s3:GetObject", resource, principal=_anonymous_root_principal)
+    client.put_bucket_policy(Bucket=bucket_name, Policy=policy_document)
+
+    # the grant reaches an unauthenticated request
+    unauthenticated_client = get_unauthenticated_client()
+    response = unauthenticated_client.get_object(Bucket=bucket_name, Key='foo')
+    assert _get_body(response) == 'bar'
+
+    access_conf = {'BlockPublicAcls': False,
+                   'IgnorePublicAcls': False,
+                   'BlockPublicPolicy': False,
+                   'RestrictPublicBuckets': True}
+    client.put_public_access_block(Bucket=bucket_name, PublicAccessBlockConfiguration=access_conf)
+
+    check_access_denied(unauthenticated_client.get_object, Bucket=bucket_name, Key='foo')
+
+    response = client.get_object(Bucket=bucket_name, Key='foo')
+    assert _get_body(response) == 'bar'
+
+
 @pytest.mark.fails_on_dbstore
 def test_block_public_restrict_public_buckets():
     bucket_name = get_new_bucket()
