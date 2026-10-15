@@ -11,6 +11,9 @@ from botocore.exceptions import ClientError
 
 from email.utils import formatdate
 import http.client
+import time
+import xml.etree.ElementTree as ET
+from urllib.parse import urlencode
 from urllib.parse import urlsplit
 from botocore.auth import HmacV1Auth
 from botocore.auth import HmacV1QueryAuth
@@ -867,6 +870,179 @@ def test_sigv2_signed_copy_source_moved_to_xgoog():
     resp = requests.put(req.url, headers=dict(req.headers), verify=get_config_ssl_verify())
     assert(resp.status_code == 200)
     assert(client.get_object(Bucket=bucket, Key='dst')['Body'].read() == b'source')
+
+@pytest.mark.auth_aws2
+def test_sigv2_presigned_multipart_meta_moved_to_query():
+    # The SigV2 string to sign of a presigned URL writes the query's
+    # x-amz-meta-* lines straight after the headers', so one signature holds
+    # with a signed X-Amz-Meta-Foo sent as a header or moved into the query,
+    # where HmacV1QueryAuth puts it. Both forms must mean the same, but RGW's
+    # CreateMultipartUpload reads its metadata from the headers alone.
+    bucket = get_new_bucket()
+    client = get_client()
+    creds = Credentials(access_key=get_main_aws_access_key(), secret_key=get_main_aws_secret_key())
+    for key, as_header in (('query', False), ('header', True)):
+        req = AWSRequest(method='POST', url=get_config_endpoint() + '/' + bucket + '/' + key + '?uploads',
+                         headers={'X-Amz-Meta-Foo': 'bar'})
+        HmacV1QueryAuth(credentials=creds, expires=3600).add_auth(req)
+        url = req.url
+        headers = {}
+        if as_header:
+            parts = urlsplit(url)
+            query = '&'.join(p for p in parts.query.split('&') if not p.startswith('x-amz-meta-foo='))
+            url = parts._replace(query=query).geturl()
+            headers = {'X-Amz-Meta-Foo': 'bar'}
+        assert(('x-amz-meta-foo=bar' in url) != as_header)
+        resp = requests.post(url, headers=headers, verify=get_config_ssl_verify())
+        assert(resp.status_code == 200)
+        upload_id = ET.fromstring(resp.content).find('{http://s3.amazonaws.com/doc/2006-03-01/}UploadId').text
+        part = client.upload_part(Bucket=bucket, Key=key, UploadId=upload_id, PartNumber=1, Body=b'data')
+        client.complete_multipart_upload(Bucket=bucket, Key=key, UploadId=upload_id,
+                                         MultipartUpload={'Parts': [{'ETag': part['ETag'], 'PartNumber': 1}]})
+        assert(client.head_object(Bucket=bucket, Key=key)['Metadata'] == {'foo': 'bar'})
+
+@pytest.mark.auth_aws2
+def test_sigv2_presigned_copy_replace_meta_in_query():
+    # A presigned URL carries the metadata it signs in its query, which the
+    # SigV2 string to sign writes after the headers' x-amz-* lines. A
+    # CopyObject that replaces its metadata must store metadata so signed as
+    # it stores metadata signed as a header, but RGW's CopyObject reads its
+    # metadata from the headers alone. The copy's own directive sorts after
+    # x-amz-meta-foo, so here the two forms sign different strings.
+    bucket = get_new_bucket()
+    client = get_client()
+    client.put_object(Bucket=bucket, Key='src', Body=b'source', Metadata={'old': 'x'})
+    signer = HmacV1Auth(credentials=Credentials(access_key=get_main_aws_access_key(),
+                                                secret_key=get_main_aws_secret_key()))
+    expires = str(int(time.time()) + 3600)
+    copy = {'X-Amz-Copy-Source': bucket + '/src', 'X-Amz-Metadata-Directive': 'REPLACE'}
+    for key, amz, query in (
+            ('query', 'x-amz-copy-source:{b}/src\nx-amz-metadata-directive:REPLACE\nx-amz-meta-foo:bar\n',
+             {'x-amz-meta-foo': 'bar'}),
+            ('header', 'x-amz-copy-source:{b}/src\nx-amz-meta-foo:bar\nx-amz-metadata-directive:REPLACE\n', {})):
+        string_to_sign = 'PUT\n\n\n' + expires + '\n' + amz.format(b=bucket) + '/' + bucket + '/' + key
+        query.update({'AWSAccessKeyId': get_main_aws_access_key(), 'Expires': expires,
+                      'Signature': signer.sign_string(string_to_sign)})
+        headers = dict(copy)
+        if key == 'header':
+            headers['X-Amz-Meta-Foo'] = 'bar'
+        resp = requests.put(get_config_endpoint() + '/' + bucket + '/' + key + '?' + urlencode(query),
+                            headers=headers, verify=get_config_ssl_verify())
+        assert(resp.status_code == 200)
+        assert(client.head_object(Bucket=bucket, Key=key)['Metadata'] == {'foo': 'bar'})
+
+@pytest.mark.auth_aws2
+def test_sigv2_presigned_meta_lines_packed_into_one_query_value():
+    # The SigV2 string to sign writes each query x-amz-meta-* line as
+    # name:value and a newline, unescaped, after url-decoding it, so one
+    # parameter whose value holds %0A signs as the several lines it spells:
+    # x-amz-meta-a=1%0Ax-amz-meta-b:2 signs as the two lines a presigned PUT
+    # with both names signs, yet stores one attr. It has to be refused.
+    bucket = get_new_bucket()
+    client = get_client()
+    creds = Credentials(access_key=get_main_aws_access_key(), secret_key=get_main_aws_secret_key())
+    req = AWSRequest(method='PUT', url=get_config_endpoint() + '/' + bucket + '/key',
+                     headers={'X-Amz-Meta-A': '1', 'X-Amz-Meta-B': '2'})
+    HmacV1QueryAuth(credentials=creds, expires=3600).add_auth(req)
+    parts = urlsplit(req.url)
+    params = parts.query.split('&')
+    assert('x-amz-meta-a=1' in params and 'x-amz-meta-b=2' in params)
+    packed = ['x-amz-meta-a=1%0Ax-amz-meta-b%3A2' if p == 'x-amz-meta-a=1' else p
+              for p in params if p != 'x-amz-meta-b=2']
+    resp = requests.put(parts._replace(query='&'.join(packed)).geturl(), data=b'packed',
+                        verify=get_config_ssl_verify())
+    assert(resp.status_code == 403)
+    e = assert_raises(ClientError, client.head_object, Bucket=bucket, Key='key')
+    assert(_get_status(e.response) == 404)
+
+    # the URL as signed stores both attrs
+    resp = requests.put(req.url, data=b'signed', verify=get_config_ssl_verify())
+    assert(resp.status_code == 200)
+    assert(client.head_object(Bucket=bucket, Key='key')['Metadata'] == {'a': '1', 'b': '2'})
+
+@pytest.mark.auth_aws2
+def test_sigv2_presigned_meta_name_with_colon():
+    # A query x-amz-meta-* line is name:value, so a colon in the name moves
+    # the boundary: the name x-amz-meta-a:x with the value y signs as
+    # x-amz-meta-a with the value x:y, yet names another attr. No header name
+    # holds a colon. It has to be refused.
+    bucket = get_new_bucket()
+    client = get_client()
+    creds = Credentials(access_key=get_main_aws_access_key(), secret_key=get_main_aws_secret_key())
+    req = AWSRequest(method='PUT', url=get_config_endpoint() + '/' + bucket + '/key',
+                     headers={'X-Amz-Meta-A': 'x:y'})
+    HmacV1QueryAuth(credentials=creds, expires=3600).add_auth(req)
+    parts = urlsplit(req.url)
+    params = parts.query.split('&')
+    assert('x-amz-meta-a=x%3Ay' in params)
+    moved = ['x-amz-meta-a%3Ax=y' if p == 'x-amz-meta-a=x%3Ay' else p for p in params]
+    resp = requests.put(parts._replace(query='&'.join(moved)).geturl(), data=b'moved',
+                        verify=get_config_ssl_verify())
+    assert(resp.status_code == 403)
+    e = assert_raises(ClientError, client.head_object, Bucket=bucket, Key='key')
+    assert(_get_status(e.response) == 404)
+
+    # the URL as signed stores the value with its colon
+    resp = requests.put(req.url, data=b'signed', verify=get_config_ssl_verify())
+    assert(resp.status_code == 200)
+    assert(client.head_object(Bucket=bucket, Key='key')['Metadata'] == {'a': 'x:y'})
+
+@pytest.mark.auth_aws2
+def test_sigv2_presigned_copy_source_moved_to_expires():
+    # A presigned URL's Expires is the SigV2 date line, written as sent, and
+    # its expiry is read with atoll, which stops at the first non-digit. So a
+    # signed X-Amz-Copy-Source line resent inside Expires, after %0A, keeps
+    # the signature and drops the copy, turning the CopyObject into a
+    # PutObject of the request's body. It has to be refused.
+    bucket = get_new_bucket()
+    client = get_client()
+    client.put_object(Bucket=bucket, Key='src', Body=b'source')
+    signer = HmacV1Auth(credentials=Credentials(access_key=get_main_aws_access_key(),
+                                                secret_key=get_main_aws_secret_key()))
+    expires = str(int(time.time()) + 3600)
+    signature = signer.sign_string('PUT\n\n\n' + expires + '\nx-amz-copy-source:' + bucket + '/src\n/' + bucket + '/dst')
+    url = get_config_endpoint() + '/' + bucket + '/dst?AWSAccessKeyId=' + get_main_aws_access_key()
+    sig = '&' + urlencode({'Signature': signature})
+    resp = requests.put(url + '&Expires=' + expires + '%0Ax-amz-copy-source%3A' + bucket + '%2Fsrc' + sig,
+                        verify=get_config_ssl_verify())
+    assert(resp.status_code == 403)
+    e = assert_raises(ClientError, client.head_object, Bucket=bucket, Key='dst')
+    assert(_get_status(e.response) == 404)
+
+    # the same signature with the header as signed copies the source
+    resp = requests.put(url + '&Expires=' + expires + sig, headers={'X-Amz-Copy-Source': bucket + '/src'},
+                        verify=get_config_ssl_verify())
+    assert(resp.status_code == 200)
+    assert(client.get_object(Bucket=bucket, Key='dst')['Body'].read() == b'source')
+
+@pytest.mark.auth_aws2
+def test_sigv2_presigned_upload_part_with_upload_id_packed_into_part_number():
+    # The SigV2 canonical resource joins the signed sub-resources with '&'
+    # and writes each url-decoded value unescaped, so partNumber=1%26uploadId%3DU
+    # signs as an UploadPart's partNumber=1&uploadId=U while it names no
+    # upload. It must not be served as a PutObject of the part's body.
+    bucket = get_new_bucket()
+    client = get_client()
+    upload_id = client.create_multipart_upload(Bucket=bucket, Key='key')['UploadId']
+    creds = Credentials(access_key=get_main_aws_access_key(), secret_key=get_main_aws_secret_key())
+    req = AWSRequest(method='PUT', url=get_config_endpoint() + '/' + bucket + '/key?' +
+                     urlencode({'partNumber': '1', 'uploadId': upload_id}))
+    HmacV1QueryAuth(credentials=creds, expires=3600).add_auth(req)
+    parts = urlsplit(req.url)
+    pair = urlencode({'partNumber': '1', 'uploadId': upload_id})
+    assert(parts.query.startswith(pair + '&'))
+    packed = urlencode({'partNumber': '1&uploadId=' + upload_id}) + parts.query[len(pair):]
+    resp = requests.put(parts._replace(query=packed).geturl(), data=b'packed', verify=get_config_ssl_verify())
+    assert(resp.status_code in (400, 403))
+    e = assert_raises(ClientError, client.head_object, Bucket=bucket, Key='key')
+    assert(_get_status(e.response) == 404)
+
+    # the URL as signed uploads the part
+    resp = requests.put(req.url, data=b'part', verify=get_config_ssl_verify())
+    assert(resp.status_code == 200)
+    client.complete_multipart_upload(Bucket=bucket, Key='key', UploadId=upload_id,
+                                     MultipartUpload={'Parts': [{'ETag': resp.headers['ETag'], 'PartNumber': 1}]})
+    assert(client.get_object(Bucket=bucket, Key='key')['Body'].read() == b'part')
 
 
 # ---------------------------------------------------------------------------
