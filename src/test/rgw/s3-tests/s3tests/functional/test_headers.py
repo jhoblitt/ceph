@@ -1049,6 +1049,24 @@ def test_sigv2_presigned_upload_part_with_upload_id_packed_into_part_number():
                                      MultipartUpload={'Parts': [{'ETag': resp.headers['ETag'], 'PartNumber': 1}]})
     assert(client.get_object(Bucket=bucket, Key='key')['Body'].read() == b'part')
 
+@pytest.mark.auth_aws2
+def test_sigv2_header_put_unsigned_meta_in_query():
+    # A SigV2 request signed in its Authorization header signs no query
+    # parameter but the sub-resources, yet RGW's PutObject merges the query's
+    # x-amz-meta-* into the object's metadata on every route. So a signed
+    # PutObject resent with ?x-amz-meta-x=1 keeps its signature and gains
+    # metadata its signer never signed. It must not be stored.
+    bucket = get_new_bucket()
+    client = get_client()
+    creds = Credentials(access_key=get_main_aws_access_key(), secret_key=get_main_aws_secret_key())
+    req = AWSRequest(method='PUT', url=get_config_endpoint() + '/' + bucket + '/key',
+                     headers={'X-Amz-Meta-Foo': 'bar'}, data=b'body')
+    HmacV1Auth(credentials=creds).add_auth(req)
+    resp = requests.put(req.url + '?x-amz-meta-x=1', headers=dict(req.headers), data=b'body',
+                        verify=get_config_ssl_verify())
+    assert(resp.status_code == 200)
+    assert(client.head_object(Bucket=bucket, Key='key')['Metadata'] == {'foo': 'bar'})
+
 
 # ---------------------------------------------------------------------------
 # X38: a signed request moved into an absolute-form request target must not be
