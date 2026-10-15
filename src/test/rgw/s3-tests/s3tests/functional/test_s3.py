@@ -15229,6 +15229,42 @@ def test_block_public_policy_with_principal():
     client.put_bucket_policy(Bucket=bucket_name, Policy=policy_document)
 
 
+def test_block_public_condition_on_unlisted_key():
+    # A grant to every principal stays public unless a condition limits it
+    # to fixed values of a key S3 lists, and aws:SecureTransport is not one:
+    # https://docs.aws.amazon.com/AmazonS3/latest/userguide/access-control-block-public-access.html#access-control-block-public-access-policy-status
+    bucket_name = get_new_bucket()
+    client = get_client()
+
+    access_conf = {'BlockPublicAcls': False,
+                   'IgnorePublicAcls': False,
+                   'BlockPublicPolicy': True,
+                   'RestrictPublicBuckets': False}
+
+    client.put_public_access_block(Bucket=bucket_name, PublicAccessBlockConfiguration=access_conf)
+    resource = _make_arn_resource("{}/{}".format(bucket_name, "*"))
+    policy_document = make_json_policy("s3:GetObject", resource,
+                                       conditions={"Bool": {"aws:SecureTransport": "true"}})
+
+    check_access_denied(client.put_bucket_policy, Bucket=bucket_name, Policy=policy_document)
+
+
+def test_get_fixed_source_ip_bucket_policy_status():
+    # A grant to every principal from one fixed address is not public:
+    # https://docs.aws.amazon.com/AmazonS3/latest/userguide/access-control-block-public-access.html#access-control-block-public-access-policy-status
+    bucket_name = get_new_bucket()
+    client = get_client()
+
+    resource1 = "arn:aws:s3:::" + bucket_name
+    resource2 = "arn:aws:s3:::" + bucket_name + "/*"
+    policy_document = make_json_policy("s3:ListBucket", [resource1, resource2],
+                                       conditions={"IpAddress": {"aws:SourceIp": "1.1.1.1/32"}})
+
+    client.put_bucket_policy(Bucket=bucket_name, Policy=policy_document)
+    resp = client.get_bucket_policy_status(Bucket=bucket_name)
+    assert resp['PolicyStatus']['IsPublic'] == False
+
+
 @pytest.mark.fails_on_dbstore
 def test_block_public_restrict_public_buckets():
     bucket_name = get_new_bucket()
