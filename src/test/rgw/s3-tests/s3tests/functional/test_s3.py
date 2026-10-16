@@ -7952,6 +7952,26 @@ def test_versioning_bucket_create_suspend():
     check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
     check_configure_versioning_retry(bucket_name, "Suspended", "Suspended")
 
+def test_versioning_bucket_invalid_status():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    e = assert_raises(ClientError, client.put_bucket_versioning, Bucket=bucket_name,
+                      VersioningConfiguration={'Status': 'enabled'})
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 400
+    assert error_code == 'MalformedXML'
+    assert 'Status' not in client.get_bucket_versioning(Bucket=bucket_name)
+
+def test_versioning_bucket_invalid_mfa_delete():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    e = assert_raises(ClientError, client.put_bucket_versioning, Bucket=bucket_name,
+                      VersioningConfiguration={'Status': 'Enabled', 'MFADelete': 'enabled'})
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 400
+    assert error_code == 'MalformedXML'
+    assert 'Status' not in client.get_bucket_versioning(Bucket=bucket_name)
+
 def check_obj_content(client, bucket_name, key, version_id, content):
     response = client.get_object(Bucket=bucket_name, Key=key, VersionId=version_id)
     if content is not None:
