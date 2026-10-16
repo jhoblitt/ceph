@@ -4,6 +4,9 @@ import botocore.config
 from botocore.exceptions import ClientError
 from botocore.exceptions import ParamValidationError
 from botocore.handlers import validate_bucket_name
+from botocore.auth import S3SigV4QueryAuth
+from botocore.awsrequest import AWSRequest
+from botocore.credentials import Credentials
 import isodate
 import email.utils
 import datetime
@@ -15408,6 +15411,48 @@ def test_put_get_delete_public_block():
         response_code = e.response['Error']['Code']
 
     assert response_code == 'NoSuchPublicAccessBlockConfiguration'
+
+def _put_raw_public_access_block(bucket_name, body):
+    # A request built and query-signed by hand sends the body as written,
+    # with no SDK serializing it. S3's model marks the operation
+    # checksum-required, so it carries the Content-MD5 an SDK would add.
+    creds = Credentials(access_key=get_main_aws_access_key(),
+                        secret_key=get_main_aws_secret_key())
+    req = AWSRequest(method='PUT',
+                     url=get_config_endpoint() + '/' + bucket_name + '?publicAccessBlock')
+    S3SigV4QueryAuth(credentials=creds, service_name='s3',
+                     region_name=get_main_api_name(), expires=100).add_auth(req)
+    md5 = base64.b64encode(hashlib.md5(body.encode()).digest()).decode()
+    return requests.put(req.url, data=body, headers={'Content-MD5': md5},
+                        verify=get_config_ssl_verify())
+
+def _check_public_block_refused(body):
+    bucket_name = get_new_bucket()
+    client = get_client()
+
+    # AWS creates a default public access block configuration; remove it so
+    # the get below shows whether the refused document stored one
+    resp = client.delete_public_access_block(Bucket=bucket_name)
+    assert resp['ResponseMetadata']['HTTPStatusCode'] == 204
+
+    res = _put_raw_public_access_block(bucket_name, body)
+    assert res.status_code == 400
+    assert ET.fromstring(res.content).findtext('Code') == 'MalformedXML'
+
+    e = assert_raises(ClientError, client.get_public_access_block, Bucket=bucket_name)
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 404
+    assert error_code == 'NoSuchPublicAccessBlockConfiguration'
+
+def test_public_block_misspelled_setting_refused():
+    # S3 answers MalformedXML to a configuration that does not match its
+    # schema. A setting under a name the schema lacks must be refused, not
+    # dropped: RGW ignores the element and stores the block with that
+    # setting off while the request succeeds.
+    _check_public_block_refused(
+        '<PublicAccessBlockConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+        '<BlockPublicACLs>true</BlockPublicACLs>'
+        '</PublicAccessBlockConfiguration>')
 
 def test_multipart_upload_on_a_bucket_with_policy():
     bucket_name = get_new_bucket()
