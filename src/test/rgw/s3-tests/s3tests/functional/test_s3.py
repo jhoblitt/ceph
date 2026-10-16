@@ -15381,6 +15381,91 @@ def test_ignore_public_acls():
     check_access_denied(alt_client.list_objects, Bucket=bucket_name)
     check_access_denied(alt_client.get_object, Bucket=bucket_name, Key='key1')
 
+
+# Every unauthenticated request runs as the user anonymous, so whatever an
+# ACL gives that user, by a grant or as its owner, it gives every
+# unauthenticated request. IgnorePublicAcls sets it aside, and
+# BlockPublicAcls refuses an ACL that keeps it, but for the rights an
+# anonymous write gives its own writer: the FULL_CONTROL of its canned ACL,
+# and the ownership its grant headers give it.
+def _anon_block_conf(block_public_acls=False, ignore_public_acls=False):
+    return {'BlockPublicAcls': block_public_acls,
+            'IgnorePublicAcls': ignore_public_acls,
+            'BlockPublicPolicy': False,
+            'RestrictPublicBuckets': False}
+
+
+def test_anon_canned_write_ignore_public_acls():
+    bucket_name = _setup_bucket_acl('public-read-write')
+    client = get_client()
+    unauthenticated_client = get_unauthenticated_client()
+
+    # an anonymous write's canned ACL grants the user anonymous FULL_CONTROL
+    unauthenticated_client.put_object(Bucket=bucket_name, Key='foo', Body='bar')
+    response = unauthenticated_client.get_object(Bucket=bucket_name, Key='foo')
+    assert _get_body(response) == 'bar'
+
+    client.put_public_access_block(Bucket=bucket_name,
+                                   PublicAccessBlockConfiguration=_anon_block_conf(ignore_public_acls=True))
+
+    check_access_denied(unauthenticated_client.get_object, Bucket=bucket_name, Key='foo')
+    check_access_denied(unauthenticated_client.get_object_acl, Bucket=bucket_name, Key='foo')
+
+
+def test_anon_owned_object_acl_ignore_public_acls():
+    bucket_name = _setup_bucket_acl('public-read-write')
+    client = get_client()
+    unauthenticated_client = get_unauthenticated_client()
+    grant = 'id="{}"'.format(get_main_user_id())
+
+    # grant headers make an anonymous writer the owner of what it writes
+    unauthenticated_client.put_object(Bucket=bucket_name, Key='foo', Body='bar', GrantRead=grant)
+    response = unauthenticated_client.get_object_acl(Bucket=bucket_name, Key='foo')
+    assert response['Owner']['ID'] == 'anonymous'
+
+    client.put_public_access_block(Bucket=bucket_name,
+                                   PublicAccessBlockConfiguration=_anon_block_conf(ignore_public_acls=True))
+
+    check_access_denied(unauthenticated_client.get_object_acl, Bucket=bucket_name, Key='foo')
+    response = client.get_object(Bucket=bucket_name, Key='foo')
+    assert _get_body(response) == 'bar'
+
+
+def test_anon_owned_object_acl_block_public_acls():
+    bucket_name = _setup_bucket_acl('public-read-write')
+    client = get_client()
+    unauthenticated_client = get_unauthenticated_client()
+    grant = 'id="{}"'.format(get_main_user_id())
+
+    unauthenticated_client.put_object(Bucket=bucket_name, Key='foo', Body='bar', GrantRead=grant)
+    unauthenticated_client.put_object_acl(Bucket=bucket_name, Key='foo', GrantRead=grant)
+
+    client.put_public_access_block(Bucket=bucket_name,
+                                   PublicAccessBlockConfiguration=_anon_block_conf(block_public_acls=True))
+
+    # an ACL the user anonymous owns is public, whoever rewrites it
+    check_access_denied(unauthenticated_client.put_object_acl, Bucket=bucket_name, Key='foo', GrantRead=grant)
+
+
+def test_anon_put_object_block_public_acls():
+    bucket_name = _setup_bucket_acl('public-read-write')
+    client = get_client()
+    unauthenticated_client = get_unauthenticated_client()
+    grant = 'id="{}"'.format(get_main_user_id())
+
+    client.put_public_access_block(Bucket=bucket_name,
+                                   PublicAccessBlockConfiguration=_anon_block_conf(block_public_acls=True))
+
+    # the rights an anonymous write gives its own writer do not make its ACL
+    # public, so only a request that names a public ACL is refused
+    response = unauthenticated_client.put_object(Bucket=bucket_name, Key='canned', Body='bar')
+    assert response['ResponseMetadata']['HTTPStatusCode'] == 200
+    response = unauthenticated_client.put_object(Bucket=bucket_name, Key='owned', Body='bar', GrantRead=grant)
+    assert response['ResponseMetadata']['HTTPStatusCode'] == 200
+    check_access_denied(unauthenticated_client.put_object, Bucket=bucket_name, Key='public', Body='bar',
+                        ACL='public-read')
+
+
 def test_put_get_delete_public_block():
     bucket_name = get_new_bucket()
     client = get_client()
