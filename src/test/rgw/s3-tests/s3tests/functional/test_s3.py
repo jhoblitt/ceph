@@ -1779,6 +1779,149 @@ def test_bucket_create_delete():
     assert status == 404
     assert error_code == 'NoSuchBucket'
 
+def test_bucket_delete_ownership_controls_keeps_bucket():
+    # DeleteBucketOwnershipControls leaves the bucket, empty or not, whether
+    # or not the gateway serves it. RGW before v21 has no op for
+    # ?ownershipControls: it serves the request as DeleteBucket and deletes an
+    # empty bucket.
+    bucket_name = get_new_bucket()
+    client = get_client()
+    try:
+        client.delete_bucket_ownership_controls(Bucket=bucket_name)
+    except ClientError:
+        pass
+    client.head_bucket(Bucket=bucket_name)
+
+    client.put_object(Bucket=bucket_name, Key='foo', Body='bar')
+    try:
+        client.delete_bucket_ownership_controls(Bucket=bucket_name)
+    except ClientError:
+        pass
+    response = client.get_object(Bucket=bucket_name, Key='foo')
+    assert _get_body(response) == 'bar'
+
+def test_bucket_delete_analytics_configuration_keeps_bucket():
+    # DeleteBucketAnalyticsConfiguration leaves the bucket, empty or not,
+    # whether or not the gateway serves it. RGW has no op for ?analytics: it
+    # serves the request as DeleteBucket and deletes an empty bucket.
+    bucket_name = get_new_bucket()
+    client = get_client()
+    try:
+        client.delete_bucket_analytics_configuration(Bucket=bucket_name, Id='config1')
+    except ClientError:
+        pass
+    client.head_bucket(Bucket=bucket_name)
+
+    client.put_object(Bucket=bucket_name, Key='foo', Body='bar')
+    try:
+        client.delete_bucket_analytics_configuration(Bucket=bucket_name, Id='config1')
+    except ClientError:
+        pass
+    response = client.get_object(Bucket=bucket_name, Key='foo')
+    assert _get_body(response) == 'bar'
+
+def test_bucket_delete_intelligent_tiering_configuration_keeps_bucket():
+    # DeleteBucketIntelligentTieringConfiguration leaves the bucket, empty or
+    # not, whether or not the gateway serves it. RGW has no op for
+    # ?intelligent-tiering: it serves the request as DeleteBucket and deletes
+    # an empty bucket.
+    bucket_name = get_new_bucket()
+    client = get_client()
+    try:
+        client.delete_bucket_intelligent_tiering_configuration(Bucket=bucket_name, Id='config1')
+    except ClientError:
+        pass
+    client.head_bucket(Bucket=bucket_name)
+
+    client.put_object(Bucket=bucket_name, Key='foo', Body='bar')
+    try:
+        client.delete_bucket_intelligent_tiering_configuration(Bucket=bucket_name, Id='config1')
+    except ClientError:
+        pass
+    response = client.get_object(Bucket=bucket_name, Key='foo')
+    assert _get_body(response) == 'bar'
+
+def test_bucket_delete_inventory_configuration_keeps_bucket():
+    # DeleteBucketInventoryConfiguration leaves the bucket, empty or not,
+    # whether or not the gateway serves it. RGW has no op for ?inventory: it
+    # serves the request as DeleteBucket and deletes an empty bucket.
+    bucket_name = get_new_bucket()
+    client = get_client()
+    try:
+        client.delete_bucket_inventory_configuration(Bucket=bucket_name, Id='config1')
+    except ClientError:
+        pass
+    client.head_bucket(Bucket=bucket_name)
+
+    client.put_object(Bucket=bucket_name, Key='foo', Body='bar')
+    try:
+        client.delete_bucket_inventory_configuration(Bucket=bucket_name, Id='config1')
+    except ClientError:
+        pass
+    response = client.get_object(Bucket=bucket_name, Key='foo')
+    assert _get_body(response) == 'bar'
+
+def test_bucket_delete_metrics_configuration_keeps_bucket():
+    # DeleteBucketMetricsConfiguration leaves the bucket, empty or not,
+    # whether or not the gateway serves it. RGW has no op for ?metrics: it
+    # serves the request as DeleteBucket and deletes an empty bucket.
+    bucket_name = get_new_bucket()
+    client = get_client()
+    try:
+        client.delete_bucket_metrics_configuration(Bucket=bucket_name, Id='config1')
+    except ClientError:
+        pass
+    client.head_bucket(Bucket=bucket_name)
+
+    client.put_object(Bucket=bucket_name, Key='foo', Body='bar')
+    try:
+        client.delete_bucket_metrics_configuration(Bucket=bucket_name, Id='config1')
+    except ClientError:
+        pass
+    response = client.get_object(Bucket=bucket_name, Key='foo')
+    assert _get_body(response) == 'bar'
+
+def test_bucket_delete_metadata_configuration_keeps_bucket():
+    # DeleteBucketMetadataConfiguration leaves the bucket, empty or not,
+    # whether or not the gateway serves it. RGW has no op for
+    # ?metadataConfiguration: it serves the request as DeleteBucket and
+    # deletes an empty bucket.
+    bucket_name = get_new_bucket()
+    client = get_client()
+    try:
+        client.delete_bucket_metadata_configuration(Bucket=bucket_name)
+    except ClientError:
+        pass
+    client.head_bucket(Bucket=bucket_name)
+
+    client.put_object(Bucket=bucket_name, Key='foo', Body='bar')
+    try:
+        client.delete_bucket_metadata_configuration(Bucket=bucket_name)
+    except ClientError:
+        pass
+    response = client.get_object(Bucket=bucket_name, Key='foo')
+    assert _get_body(response) == 'bar'
+
+def test_bucket_delete_metadata_table_configuration_keeps_bucket():
+    # DeleteBucketMetadataTableConfiguration leaves the bucket, empty or not,
+    # whether or not the gateway serves it. RGW has no op for ?metadataTable:
+    # it serves the request as DeleteBucket and deletes an empty bucket.
+    bucket_name = get_new_bucket()
+    client = get_client()
+    try:
+        client.delete_bucket_metadata_table_configuration(Bucket=bucket_name)
+    except ClientError:
+        pass
+    client.head_bucket(Bucket=bucket_name)
+
+    client.put_object(Bucket=bucket_name, Key='foo', Body='bar')
+    try:
+        client.delete_bucket_metadata_table_configuration(Bucket=bucket_name)
+    except ClientError:
+        pass
+    response = client.get_object(Bucket=bucket_name, Key='foo')
+    assert _get_body(response) == 'bar'
+
 def test_object_read_not_exist():
     bucket_name = get_new_bucket()
     client = get_client()
@@ -2095,6 +2238,87 @@ def test_object_metadata_replaced_on_put():
     response = client.get_object(Bucket=bucket_name, Key='foo')
     got = response['Metadata']
     assert got == {}
+
+def test_object_put_annotation_keeps_object():
+    # PutObjectAnnotation leaves the object's data and metadata, whether or
+    # not the gateway serves it. RGW has no op for ?annotation: it serves the
+    # request as PutObject and replaces the object with the annotation.
+    bucket_name = get_new_bucket()
+    client = get_client()
+    client.put_object(Bucket=bucket_name, Key='foo', Body='bar',
+                      ContentType='text/plain', Metadata={'meta1': 'mymeta'})
+
+    try:
+        client.put_object_annotation(Bucket=bucket_name, Key='foo',
+                                     AnnotationName='note', AnnotationPayload='soup')
+    except ClientError:
+        pass
+
+    response = client.get_object(Bucket=bucket_name, Key='foo')
+    assert _get_body(response) == 'bar'
+    assert response['ContentType'] == 'text/plain'
+    assert response['Metadata'] == {'meta1': 'mymeta'}
+
+def test_object_delete_annotation_keeps_object():
+    # DeleteObjectAnnotation leaves the object, whether or not the gateway
+    # serves it. RGW has no op for ?annotation: it serves the request as
+    # DeleteObject and deletes the object.
+    bucket_name = get_new_bucket()
+    client = get_client()
+    client.put_object(Bucket=bucket_name, Key='foo', Body='bar',
+                      ContentType='text/plain', Metadata={'meta1': 'mymeta'})
+
+    try:
+        client.delete_object_annotation(Bucket=bucket_name, Key='foo', AnnotationName='note')
+    except ClientError:
+        pass
+
+    response = client.get_object(Bucket=bucket_name, Key='foo')
+    assert _get_body(response) == 'bar'
+    assert response['ContentType'] == 'text/plain'
+    assert response['Metadata'] == {'meta1': 'mymeta'}
+
+def test_object_rename_missing_source_keeps_object():
+    # RenameObject from a source that does not exist leaves the object at the
+    # destination as it was, whether or not the gateway serves it. RGW has no
+    # op for ?renameObject: it serves the request as PutObject and replaces
+    # the object with an empty one.
+    bucket_name = get_new_bucket()
+    client = get_client()
+    client.put_object(Bucket=bucket_name, Key='foo', Body='bar',
+                      ContentType='text/plain', Metadata={'meta1': 'mymeta'})
+
+    try:
+        client.rename_object(Bucket=bucket_name, Key='foo', RenameSource=bucket_name + '/missing')
+    except ClientError:
+        pass
+
+    response = client.get_object(Bucket=bucket_name, Key='foo')
+    assert _get_body(response) == 'bar'
+    assert response['ContentType'] == 'text/plain'
+    assert response['Metadata'] == {'meta1': 'mymeta'}
+
+def test_object_update_encryption_keeps_object():
+    # UpdateObjectEncryption changes how an object is encrypted and leaves its
+    # data and metadata, whether or not the gateway serves it. RGW has no op
+    # for an object's ?encryption: it serves the request as PutObject and
+    # replaces the object with the request's document.
+    bucket_name = get_new_bucket()
+    client = get_client()
+    client.put_object(Bucket=bucket_name, Key='foo', Body='bar',
+                      ContentType='text/plain', Metadata={'meta1': 'mymeta'})
+
+    key_arn = 'arn:aws:kms:us-east-1:123456789012:key/1234abcd-12ab-34cd-56ef-1234567890ab'
+    try:
+        client.update_object_encryption(Bucket=bucket_name, Key='foo',
+                                        ObjectEncryption={'SSEKMS': {'KMSKeyArn': key_arn}})
+    except ClientError:
+        pass
+
+    response = client.get_object(Bucket=bucket_name, Key='foo')
+    assert _get_body(response) == 'bar'
+    assert response['ContentType'] == 'text/plain'
+    assert response['Metadata'] == {'meta1': 'mymeta'}
 
 def test_object_write_file():
     bucket_name = get_new_bucket()
