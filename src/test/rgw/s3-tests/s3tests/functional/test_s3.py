@@ -9733,6 +9733,118 @@ def test_lifecycle_set_invalid_date():
     status, error_code = _get_status_and_error_code(e.response)
     assert status == 400
 
+def _put_raw_subresource(bucket_name, subresource, body, content_md5=None):
+    # A request built and query-signed by hand sends the body as written,
+    # with no SDK serializing it, so it can hold text boto3 would not write.
+    # The bucket configuration operations S3's model marks checksum-required
+    # carry the Content-MD5 an SDK would add, the body's unless content_md5
+    # gives another.
+    creds = Credentials(access_key=get_main_aws_access_key(),
+                        secret_key=get_main_aws_secret_key())
+    req = AWSRequest(method='PUT',
+                     url=get_config_endpoint() + '/' + bucket_name + '?' + subresource)
+    S3SigV4QueryAuth(credentials=creds, service_name='s3',
+                     region_name=get_main_api_name(), expires=100).add_auth(req)
+    if content_md5 is None:
+        content_md5 = base64.b64encode(hashlib.md5(body.encode()).digest()).decode()
+    return requests.put(req.url, data=body, headers={'Content-MD5': content_md5},
+                        verify=get_config_ssl_verify())
+
+def _lifecycle_rule_document(action):
+    return ('<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+            '<Rule><ID>rule1</ID><Filter><Prefix>test1/</Prefix></Filter>'
+            '<Status>Enabled</Status>' + action + '</Rule></LifecycleConfiguration>')
+
+def _assert_no_lifecycle(client, bucket_name):
+    e = assert_raises(ClientError, client.get_bucket_lifecycle_configuration, Bucket=bucket_name)
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 404
+    assert error_code == 'NoSuchLifecycleConfiguration'
+
+def _check_lifecycle_refused(rule, code):
+    bucket_name = get_new_bucket()
+    client = get_client()
+    e = assert_raises(ClientError, client.put_bucket_lifecycle_configuration,
+                      Bucket=bucket_name, LifecycleConfiguration={'Rules': [rule]})
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 400
+    assert error_code == code
+    _assert_no_lifecycle(client, bucket_name)
+
+def _check_raw_lifecycle_refused(action):
+    bucket_name = get_new_bucket()
+    client = get_client()
+    res = _put_raw_subresource(bucket_name, 'lifecycle', _lifecycle_rule_document(action))
+    assert res.status_code == 400
+    assert ET.fromstring(res.content).findtext('Code') == 'MalformedXML'
+    _assert_no_lifecycle(client, bucket_name)
+
+@pytest.mark.lifecycle
+@pytest.mark.parametrize('size', ['ObjectSizeGreaterThan', 'ObjectSizeLessThan'])
+def test_lifecycle_negative_object_size(size):
+    # S3 refuses a negative object size. RGW stores it as text, which its
+    # worker reads as an unsigned size near 2^64, so a negative
+    # ObjectSizeLessThan matches every object.
+    _check_lifecycle_refused({'ID': 'rule1', 'Filter': {size: -1}, 'Status': 'Enabled',
+                              'Expiration': {'Days': 1}}, 'InvalidArgument')
+
+@pytest.mark.lifecycle
+@pytest.mark.parametrize('newer', [0, 101])
+def test_lifecycle_newer_noncurrent_versions_out_of_range(newer):
+    # S3 takes NewerNoncurrentVersions from 1 to 100.
+    _check_lifecycle_refused({'ID': 'rule1', 'Filter': {'Prefix': 'test1/'}, 'Status': 'Enabled',
+                              'NoncurrentVersionExpiration': {'NoncurrentDays': 1,
+                                                              'NewerNoncurrentVersions': newer}},
+                             'InvalidArgument')
+
+@pytest.mark.lifecycle
+def test_lifecycle_expired_object_delete_marker_one():
+    # ExpiredObjectDeleteMarker is an xs:boolean, whose lexical forms
+    # include 1 for true. RGW takes only the text "true" for the action, and
+    # refuses the rule it then reads with no action as InvalidArgument.
+    bucket_name = get_new_bucket()
+    client = get_client()
+    res = _put_raw_subresource(bucket_name, 'lifecycle', _lifecycle_rule_document(
+        '<Expiration><ExpiredObjectDeleteMarker>1</ExpiredObjectDeleteMarker></Expiration>'))
+    assert res.status_code == 200
+    response = client.get_bucket_lifecycle_configuration(Bucket=bucket_name)
+    assert response['Rules'][0]['Expiration'] == {'ExpiredObjectDeleteMarker': True}
+
+@pytest.mark.lifecycle
+def test_lifecycle_expired_object_delete_marker_not_boolean():
+    # S3 answers MalformedXML to a value outside its schema's type; RGW
+    # reads the rule with no action and answers InvalidArgument.
+    _check_raw_lifecycle_refused(
+        '<Expiration><ExpiredObjectDeleteMarker>yes</ExpiredObjectDeleteMarker></Expiration>')
+
+@pytest.mark.lifecycle
+@pytest.mark.parametrize('date', [
+    '2026-01-01T00:00:01Z',  # not at midnight
+    '2026-04-31T00:00:00Z',  # no such calendar date; RGW rolls it to May 1
+    '2026-01-01',            # a date without a time, which RGW stores as written
+])
+def test_lifecycle_expiration_date_refused(date):
+    # S3 takes an Expiration Date as an ISO 8601 timestamp at midnight UTC.
+    _check_raw_lifecycle_refused('<Expiration><Date>' + date + '</Date></Expiration>')
+
+@pytest.mark.lifecycle
+def test_lifecycle_content_md5_not_a_digest():
+    # S3 answers a Content-MD5 that is not a 16-byte digest with
+    # InvalidDigest, as test_object_create_bad_md5_invalid_short expects of
+    # PutObject. RGW compares 16 bytes of whatever the value decodes to, so
+    # it takes a longer value that starts with the body's MD5, and answers
+    # a short one with BadDigest.
+    bucket_name = get_new_bucket()
+    client = get_client()
+    body = _lifecycle_rule_document('<Expiration><Days>1</Days></Expiration>')
+    digest = hashlib.md5(body.encode()).digest()
+    for value in [digest + b'x', b'abracadabra']:
+        res = _put_raw_subresource(bucket_name, 'lifecycle', body,
+                                   content_md5=base64.b64encode(value).decode())
+        assert res.status_code == 400
+        assert ET.fromstring(res.content).findtext('Code') == 'InvalidDigest'
+    _assert_no_lifecycle(client, bucket_name)
+
 @pytest.mark.lifecycle
 @pytest.mark.lifecycle_expiration
 @pytest.mark.fails_on_aws
@@ -15742,18 +15854,7 @@ def test_put_get_delete_public_block():
     assert response_code == 'NoSuchPublicAccessBlockConfiguration'
 
 def _put_raw_public_access_block(bucket_name, body):
-    # A request built and query-signed by hand sends the body as written,
-    # with no SDK serializing it. S3's model marks the operation
-    # checksum-required, so it carries the Content-MD5 an SDK would add.
-    creds = Credentials(access_key=get_main_aws_access_key(),
-                        secret_key=get_main_aws_secret_key())
-    req = AWSRequest(method='PUT',
-                     url=get_config_endpoint() + '/' + bucket_name + '?publicAccessBlock')
-    S3SigV4QueryAuth(credentials=creds, service_name='s3',
-                     region_name=get_main_api_name(), expires=100).add_auth(req)
-    md5 = base64.b64encode(hashlib.md5(body.encode()).digest()).decode()
-    return requests.put(req.url, data=body, headers={'Content-MD5': md5},
-                        verify=get_config_ssl_verify())
+    return _put_raw_subresource(bucket_name, 'publicAccessBlock', body)
 
 def _check_public_block_refused(body):
     bucket_name = get_new_bucket()
