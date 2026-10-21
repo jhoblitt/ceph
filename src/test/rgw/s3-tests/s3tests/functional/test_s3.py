@@ -15945,6 +15945,101 @@ def test_delete_bucket_encryption_kms():
 
     assert response_code == 'ServerSideEncryptionConfigurationNotFoundError'
 
+@pytest.mark.sse_s3
+def test_put_bucket_encryption_unknown_algorithm_refused():
+    # S3 takes an SSEAlgorithm of AES256, aws:kms, aws:kms:dsse, aws:fsx or
+    # aws:backup, and answers MalformedXML to any other, leaving the
+    # bucket's configuration as it was. RGW stores whatever algorithm the
+    # document names.
+    bucket_name = get_new_bucket()
+    client = get_client()
+    _put_bucket_encryption_s3(client, bucket_name)
+
+    server_side_encryption_conf = {
+        'Rules': [
+            {
+                'ApplyServerSideEncryptionByDefault': {
+                    'SSEAlgorithm': 'AES-256'
+                }
+            },
+        ]
+    }
+    e = assert_raises(ClientError, client.put_bucket_encryption, Bucket=bucket_name,
+                      ServerSideEncryptionConfiguration=server_side_encryption_conf)
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 400
+    assert error_code == 'MalformedXML'
+
+    response = client.get_bucket_encryption(Bucket=bucket_name)
+    rule = response['ServerSideEncryptionConfiguration']['Rules'][0]
+    assert rule['ApplyServerSideEncryptionByDefault']['SSEAlgorithm'] == 'AES256'
+
+@pytest.mark.encryption
+def test_get_bucket_encryption_kms_bucket_key_enabled():
+    # A configuration that turns the bucket key on reads back with
+    # BucketKeyEnabled true. RGW writes the element as True, which botocore
+    # reads as false.
+    kms_keyid = get_main_kms_keyid()
+    if kms_keyid is None:
+        kms_keyid = 'fool-me-again'
+    bucket_name = get_new_bucket()
+    client = get_client()
+
+    server_side_encryption_conf = {
+        'Rules': [
+            {
+                'ApplyServerSideEncryptionByDefault': {
+                    'SSEAlgorithm': 'aws:kms',
+                    'KMSMasterKeyID': kms_keyid
+                },
+                'BucketKeyEnabled': True
+            },
+        ]
+    }
+    response = client.put_bucket_encryption(Bucket=bucket_name, ServerSideEncryptionConfiguration=server_side_encryption_conf)
+    assert response['ResponseMetadata']['HTTPStatusCode'] == 200
+
+    response = client.get_bucket_encryption(Bucket=bucket_name)
+    rule = response['ServerSideEncryptionConfiguration']['Rules'][0]
+    assert rule['ApplyServerSideEncryptionByDefault']['SSEAlgorithm'] == 'aws:kms'
+    assert rule['ApplyServerSideEncryptionByDefault']['KMSMasterKeyID'] == kms_keyid
+    assert rule.get('BucketKeyEnabled') is True
+
+@pytest.mark.sse_s3
+def test_put_bucket_encryption_misspelled_element_refused():
+    # S3 answers MalformedXML to a configuration that does not match its
+    # schema, leaving the bucket's configuration as it was. An SSEAlgorithm
+    # under a name the schema lacks must be refused, not dropped: RGW ignores
+    # the element and stores a rule with no algorithm while the request
+    # succeeds.
+    bucket_name = get_new_bucket()
+    client = get_client()
+    _put_bucket_encryption_s3(client, bucket_name)
+
+    body = ('<ServerSideEncryptionConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+            '<Rule><ApplyServerSideEncryptionByDefault>'
+            '<SseAlgorithm>AES256</SseAlgorithm>'
+            '</ApplyServerSideEncryptionByDefault></Rule>'
+            '</ServerSideEncryptionConfiguration>')
+    # A request built and query-signed by hand sends the document as
+    # written, with no SDK serializing it. S3's model marks the operation
+    # checksum-required, so it carries the Content-MD5 an SDK would add.
+    creds = Credentials(access_key=get_main_aws_access_key(),
+                        secret_key=get_main_aws_secret_key())
+    req = AWSRequest(method='PUT',
+                     url=get_config_endpoint() + '/' + bucket_name + '?encryption')
+    S3SigV4QueryAuth(credentials=creds, service_name='s3',
+                     region_name=get_main_api_name(), expires=100).add_auth(req)
+    md5 = base64.b64encode(hashlib.md5(body.encode()).digest()).decode()
+    res = requests.put(req.url, data=body, headers={'Content-MD5': md5},
+                       verify=get_config_ssl_verify())
+    assert res.status_code == 400
+    assert ET.fromstring(res.content).findtext('Code') == 'MalformedXML'
+
+    response = client.get_bucket_encryption(Bucket=bucket_name)
+    rule = response['ServerSideEncryptionConfiguration']['Rules'][0]
+    assert rule['ApplyServerSideEncryptionByDefault']['SSEAlgorithm'] == 'AES256'
+
 def _put_bucket_blocked_encryption_types(client, bucket_name, types):
     """
     block the given encryption types on the bucket. 'NONE' unblocks
