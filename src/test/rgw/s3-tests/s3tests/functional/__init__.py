@@ -266,6 +266,9 @@ def configure():
     # with its default step and window, and its seed in hex.
     config.main_mfa_serial = cfg.get('s3 main', 'mfa_serial', fallback=None)
     config.main_mfa_seed = cfg.get('s3 main', 'mfa_seed', fallback=None)
+    # The domain the gateway serves its website endpoint under, RGW's
+    # rgw_dns_s3website_name, that a bucket's name goes in front of.
+    config.main_s3website_domain = cfg.get('s3 main', 's3website_domain', fallback=None)
     try:
         config.main_kms_keyid = cfg.get('s3 main',"kms_keyid")
     except (configparser.NoSectionError, configparser.NoOptionError):
@@ -802,6 +805,13 @@ def get_main_mfa_device():
     if not config.main_mfa_serial or not config.main_mfa_seed:
         pytest.skip('[s3 main] names no mfa_serial and mfa_seed')
     return config.main_mfa_serial, config.main_mfa_seed
+
+def get_main_s3website_domain():
+    """The website endpoint's domain; skips the test when the config names
+    none."""
+    if not config.main_s3website_domain:
+        pytest.skip('[s3 main] names no s3website_domain')
+    return config.main_s3website_domain
 
 def get_main_kms_keyid():
     return config.main_kms_keyid

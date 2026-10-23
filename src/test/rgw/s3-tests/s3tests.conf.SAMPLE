@@ -52,6 +52,10 @@ secret_key = h7GhxuBLTrlhVUyxSPUKUV8r/2EI4ngqJxD7iBdBYLhwluN30JaT3Q==
 ## Storage classes
 #storage_classes = "LUKEWARM, FROZEN"
 
+## the domain of the website endpoint, rgw_dns_s3website_name; the s3website
+## tests skip without it
+#s3website_domain = s3-website.example.com
+
 ## Lifecycle debug interval (default: 10)
 #lc_debug_interval = 20
 ## Restore debug interval (default: 100)

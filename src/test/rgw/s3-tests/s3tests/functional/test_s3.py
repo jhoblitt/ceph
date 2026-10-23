@@ -67,6 +67,7 @@ from . import (
     get_main_email,
     get_main_api_name,
     get_main_mfa_device,
+    get_main_s3website_domain,
     get_alt_aws_access_key,
     get_alt_aws_secret_key,
     get_alt_display_name,
@@ -23108,3 +23109,281 @@ def test_cors_presigned_url_non_preflight():
     _cors_request_and_check(requests.post, presigned_url,
                             {'Origin':'example1.com'},
                             403, None, None)
+
+
+class _WebsiteConnection:
+    """One HTTP/1.1 connection to the gateway's website endpoint, read by
+    hand, so that a test sees what a response sends past its end."""
+
+    def __init__(self):
+        host = get_config_host()
+        sock = socket.create_connection((host, get_config_port()), timeout=10)
+        if get_config_is_secure():
+            ctx = ssl.create_default_context()
+            if not get_config_ssl_verify():
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+            sock = ctx.wrap_socket(sock, server_hostname=host)
+        self.sock = sock
+        self.buf = b''
+
+    def close(self):
+        self.sock.close()
+
+    def send(self, method, bucket_name, path, headers=None, body=b''):
+        """Sends method for path in the website of bucket_name."""
+        lines = ['{} {} HTTP/1.1'.format(method, path),
+                 'Host: {}.{}'.format(bucket_name, get_main_s3website_domain())]
+        lines += ['{}: {}'.format(name, value) for name, value in (headers or {}).items()]
+        if body:
+            lines.append('Content-Length: {}'.format(len(body)))
+        self.sock.sendall(('\r\n'.join(lines) + '\r\n\r\n').encode() + body)
+
+    def _fill(self):
+        data = self.sock.recv(65536)
+        if not data:
+            raise EOFError('the connection closed')
+        self.buf += data
+
+    def _line(self):
+        while b'\r\n' not in self.buf:
+            self._fill()
+        line, self.buf = self.buf.split(b'\r\n', 1)
+        return line
+
+    def _read(self, n):
+        while len(self.buf) < n:
+            self._fill()
+        data, self.buf = self.buf[:n], self.buf[n:]
+        return data
+
+    def response(self, head=False):
+        """The next response's status, its headers by lower-cased name, and
+        its body, which a HEAD's has none of."""
+        status_line = self._line().decode('iso-8859-1')
+        assert status_line.startswith('HTTP/1.1 '), status_line
+        status = int(status_line.split(' ')[1])
+        headers = {}
+        while True:
+            line = self._line().decode('iso-8859-1')
+            if not line:
+                break
+            name, _, value = line.partition(':')
+            headers[name.strip().lower()] = value.strip()
+        if head or status in (204, 304):
+            return status, headers, b''
+        if headers.get('transfer-encoding', '').lower() == 'chunked':
+            body = b''
+            while True:
+                size = int(self._line().split(b';')[0], 16)
+                if size == 0:
+                    while self._line():
+                        pass
+                    return status, headers, body
+                body += self._read(size)
+                self._line()
+        return status, headers, self._read(int(headers['content-length']))
+
+    def rest(self):
+        """What the connection sends until it closes."""
+        while True:
+            data = self.sock.recv(65536)
+            if not data:
+                return self.buf
+            self.buf += data
+
+def _website_request(bucket_name, method, path, headers=None, body=b''):
+    """One website request on a connection of its own, as the status, the
+    headers and the body of its response."""
+    conn = _WebsiteConnection()
+    try:
+        conn.send(method, bucket_name, path, dict(headers or {}, Connection='close'), body)
+        return conn.response(head=method == 'HEAD')
+    finally:
+        conn.close()
+
+def _setup_website_bucket(client, website_configuration, objects=None):
+    """A bucket serving website_configuration to anonymous readers, holding
+    objects, a map of key to body. ListBucket is granted too, without which
+    a missing key is 403 rather than 404."""
+    get_main_s3website_domain()
+    bucket_name = get_new_bucket(client)
+    policy = json.dumps({
+        'Version': '2012-10-17',
+        'Statement': [
+            {'Effect': 'Allow', 'Principal': '*', 'Action': 's3:GetObject',
+             'Resource': 'arn:aws:s3:::{}/*'.format(bucket_name)},
+            {'Effect': 'Allow', 'Principal': '*', 'Action': 's3:ListBucket',
+             'Resource': 'arn:aws:s3:::{}'.format(bucket_name)},
+        ],
+    })
+    client.put_bucket_policy(Bucket=bucket_name, Policy=policy)
+    client.put_bucket_website(Bucket=bucket_name, WebsiteConfiguration=website_configuration)
+    for key, body in (objects or {}).items():
+        client.put_object(Bucket=bucket_name, Key=key, Body=body, ContentType='text/html')
+    return bucket_name
+
+_WEBSITE_INDEX = {'IndexDocument': {'Suffix': 'index.html'}}
+_WEBSITE_ERROR_DOCUMENT = {'IndexDocument': {'Suffix': 'index.html'}, 'ErrorDocument': {'Key': 'error.html'}}
+_ERROR_DOCUMENT = '<p>custom error</p>'
+
+@pytest.mark.s3website
+def test_website_put_post_delete_405_html():
+    # The website endpoint serves GET and HEAD alone, and answers any other
+    # method 405 with its HTML error page.
+    client = get_client()
+    bucket_name = _setup_website_bucket(client, _WEBSITE_INDEX, {'index.html': '<p>index</p>'})
+    for method, body in (('PUT', b'x'), ('POST', b'x'), ('DELETE', b'')):
+        status, headers, page = _website_request(bucket_name, method, '/index.html', body=body)
+        assert status == 405, method
+        assert headers['content-type'].startswith('text/html'), method
+        assert b'Code: MethodNotAllowed' in page, method
+    response = client.get_object(Bucket=bucket_name, Key='index.html')
+    assert _get_body(response) == '<p>index</p>'
+
+@pytest.mark.s3website
+@pytest.mark.fails_on_rgw
+def test_website_missing_key_html_error():
+    # The HTML error page ends where its Content-Length says. RGW sends a
+    # line break after the page, which a client that keeps the connection
+    # reads as the start of its next response.
+    client = get_client()
+    bucket_name = _setup_website_bucket(client, _WEBSITE_INDEX)
+    conn = _WebsiteConnection()
+    try:
+        conn.send('GET', bucket_name, '/missing.html', {'Connection': 'close'})
+        status, headers, page = conn.response()
+        assert status == 404
+        assert headers['content-type'].startswith('text/html')
+        assert b'Code: NoSuchKey' in page
+        assert conn.rest() == b''
+    finally:
+        conn.close()
+
+@pytest.mark.s3website
+def test_website_error_document_served_with_status():
+    client = get_client()
+    bucket_name = _setup_website_bucket(client, _WEBSITE_ERROR_DOCUMENT, {'error.html': _ERROR_DOCUMENT})
+    status, _, body = _website_request(bucket_name, 'GET', '/missing.html')
+    assert status == 404
+    assert body == _ERROR_DOCUMENT.encode()
+
+@pytest.mark.s3website
+@pytest.mark.fails_on_aws
+@pytest.mark.fails_on_rgw
+def test_website_error_document_conditional_unconditional():
+    # The error document stands in for an error about another key, so the
+    # request's conditionals do not apply to it. S3 documents no answer for
+    # this. RGW reads the document under them, and answers an If-None-Match
+    # its ETag matches with the error's status and no body.
+    client = get_client()
+    bucket_name = _setup_website_bucket(client, _WEBSITE_ERROR_DOCUMENT, {'error.html': _ERROR_DOCUMENT})
+    etag = client.head_object(Bucket=bucket_name, Key='error.html')['ETag']
+    status, _, body = _website_request(bucket_name, 'GET', '/missing.html', {'If-None-Match': etag})
+    assert status == 404
+    assert body == _ERROR_DOCUMENT.encode()
+
+@pytest.mark.s3website
+@pytest.mark.fails_on_aws
+@pytest.mark.fails_on_rgw
+def test_website_error_document_range_whole():
+    # The error document stands in for an error about another key, so the
+    # request's Range does not apply to it. S3 documents no answer for this.
+    # RGW reads the document under the Range, and sends the range alone.
+    client = get_client()
+    bucket_name = _setup_website_bucket(client, _WEBSITE_ERROR_DOCUMENT, {'error.html': _ERROR_DOCUMENT})
+    status, _, body = _website_request(bucket_name, 'GET', '/missing.html', {'Range': 'bytes=0-3'})
+    assert status == 404
+    assert body == _ERROR_DOCUMENT.encode()
+
+@pytest.mark.s3website
+@pytest.mark.fails_on_rgw
+def test_website_head_error_document_no_body():
+    # A response to a HEAD has no body, so the next response on the
+    # connection starts where its headers end. RGW sends a HEAD answered
+    # with the error document the document's body.
+    client = get_client()
+    bucket_name = _setup_website_bucket(client, _WEBSITE_ERROR_DOCUMENT, {'error.html': _ERROR_DOCUMENT})
+    conn = _WebsiteConnection()
+    try:
+        conn.send('HEAD', bucket_name, '/missing.html')
+        status, _, _ = conn.response(head=True)
+        assert status == 404
+        conn.send('GET', bucket_name, '/missing.html')
+        status, _, body = conn.response()
+        assert status == 404
+        assert body == _ERROR_DOCUMENT.encode()
+    finally:
+        conn.close()
+
+@pytest.mark.s3website
+@pytest.mark.s3website_routing_rules
+def test_website_routing_rule_on_404():
+    # A rule on HttpErrorCodeReturnedEquals redirects a request that met that
+    # error, at 301 when the rule names no code, under the request's own
+    # protocol when it names none.
+    client = get_client()
+    configuration = {
+        'IndexDocument': {'Suffix': 'index.html'},
+        'RoutingRules': [{
+            'Condition': {'HttpErrorCodeReturnedEquals': '404'},
+            'Redirect': {'HostName': 'example.com', 'ReplaceKeyPrefixWith': 'report-404/'},
+        }],
+    }
+    bucket_name = _setup_website_bucket(client, configuration, {'index.html': '<p>index</p>'})
+    protocol = 'https' if get_config_is_secure() else 'http'
+    status, headers, _ = _website_request(bucket_name, 'GET', '/missing.html')
+    assert status == 301
+    assert headers['location'] == protocol + '://example.com/report-404/missing.html'
+    status, _, body = _website_request(bucket_name, 'GET', '/index.html')
+    assert status == 200
+    assert body == b'<p>index</p>'
+
+@pytest.mark.s3website
+@pytest.mark.fails_on_aws
+def test_website_execute_failure_skips_error_document():
+    # RGW answers a precondition the object fails from the read itself, with
+    # the HTML error page: its error document stands in only for an error met
+    # before the read. S3 documents no answer for a failed precondition on
+    # its website endpoint.
+    client = get_client()
+    bucket_name = _setup_website_bucket(client, _WEBSITE_ERROR_DOCUMENT,
+                                        {'index.html': '<p>index</p>', 'error.html': _ERROR_DOCUMENT})
+    status, headers, page = _website_request(bucket_name, 'GET', '/index.html', {'If-Match': '"no-such-etag"'})
+    assert status == 412
+    assert headers['content-type'].startswith('text/html')
+    assert b'Code: PreconditionFailed' in page
+
+@pytest.mark.s3website
+def test_website_error_document_missing_falls_back():
+    # With the error document itself missing, the error gets the HTML error
+    # page.
+    client = get_client()
+    bucket_name = _setup_website_bucket(client, _WEBSITE_ERROR_DOCUMENT)
+    status, headers, page = _website_request(bucket_name, 'GET', '/missing.html')
+    assert status == 404
+    assert headers['content-type'].startswith('text/html')
+    assert b'Code: NoSuchKey' in page
+
+@pytest.mark.s3website
+@pytest.mark.s3website_redirect_location
+@pytest.mark.fails_on_rgw
+def test_website_object_redirect_location():
+    # An object's x-amz-website-redirect-location is answered with one 301
+    # to it. RGW sends a second 301 after the first, which a client that
+    # keeps the connection reads as the answer to its next request.
+    client = get_client()
+    bucket_name = _setup_website_bucket(client, _WEBSITE_INDEX, {'index.html': '<p>index</p>'})
+    client.put_object(Bucket=bucket_name, Key='page.html', Body='<p>page</p>', WebsiteRedirectLocation='/index.html')
+    conn = _WebsiteConnection()
+    try:
+        conn.send('GET', bucket_name, '/page.html')
+        status, headers, _ = conn.response()
+        assert status == 301
+        assert headers['location'] == '/index.html'
+        conn.send('GET', bucket_name, '/index.html')
+        status, _, body = conn.response()
+        assert status == 200
+        assert body == b'<p>index</p>'
+    finally:
+        conn.close()
