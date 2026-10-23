@@ -301,6 +301,20 @@ def test_bucket_listv2_encoding_echo():
     _assert_url_encoded(response, sent)
     assert [unquote_plus(k) for k in _get_keys(response)] == ['d/a+b/1', 'd/a+b/2']
 
+@pytest.mark.fails_on_rgw
+def test_bucket_list_encoding_marker_echo():
+    # S3's ListObjects reference names no list of encoded elements, but
+    # botocore decodes Marker, as it does Delimiter, NextMarker and each Key,
+    # when it chose encoding-type=url. RGW writes Marker as it was sent.
+    bucket_name = _create_objects(keys=['d/a+b/1', 'd/a+b/2'])
+    client = get_client()
+
+    sent = {'Marker': 'd/a+b/0'}
+    response = client.list_objects(Bucket=bucket_name, EncodingType='url', **sent)
+    assert response['EncodingType'] == 'url'
+    _assert_url_encoded(response, sent)
+    assert [unquote_plus(k) for k in _get_keys(response)] == ['d/a+b/1', 'd/a+b/2']
+
 
 def validate_bucket_list(bucket_name, prefix, delimiter, marker, max_keys,
                          is_truncated, check_objs, check_prefixes, next_marker):
