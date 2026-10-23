@@ -8797,6 +8797,25 @@ def test_versioning_list_versions_paginated():
     assert response['NextKeyMarker'] == 'k'
     assert response['NextVersionIdMarker'] == 'null'
 
+@pytest.mark.versioning
+@pytest.mark.fails_on_rgw
+def test_versioning_list_versions_paginated_null_delete_marker():
+    # On a suspended bucket a delete with no version id writes a null delete
+    # marker. A page that ends on it names it null, and the next page goes
+    # on with the key's older versions. RGW looks for the null version at the
+    # null data key alone, which a delete marker does not have, and starts
+    # past every version of the key.
+    bucket_name = get_new_bucket()
+    client = get_client()
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+    old = client.put_object(Bucket=bucket_name, Key='k', Body='old')['VersionId']
+    check_configure_versioning_retry(bucket_name, "Suspended", "Suspended")
+    client.delete_object(Bucket=bucket_name, Key='k')
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+    new = client.put_object(Bucket=bucket_name, Key='k', Body='new')['VersionId']
+
+    assert _page_versions(client, bucket_name, 1) == [('k', new), ('k', 'null'), ('k', old)]
+
 @pytest.mark.fails_on_dbstore
 @pytest.mark.versioning
 def test_versioning_copy_obj_version():
