@@ -8833,6 +8833,44 @@ def test_versioning_list_versions_key_marker_alone():
     assert response['KeyMarker'] == 'k'
     assert [v['Key'] for v in response['Versions']] == ['z', 'z']
 
+def _get_raw_bucket(bucket_name, query):
+    # A GET built and query-signed by hand, for a bucket query boto3 has no
+    # operation for.
+    creds = Credentials(access_key=get_main_aws_access_key(),
+                        secret_key=get_main_aws_secret_key())
+    req = AWSRequest(method='GET',
+                     url=get_config_endpoint() + '/' + bucket_name + '?' + query)
+    S3SigV4QueryAuth(credentials=creds, service_name='s3',
+                     region_name=get_main_api_name(), expires=100).add_auth(req)
+    return requests.get(req.url, verify=get_config_ssl_verify())
+
+def _raw_version_ids(res):
+    assert res.status_code == 200, res.content
+    ns = {'s3': 'http://s3.amazonaws.com/doc/2006-03-01/'}
+    doc = ET.fromstring(res.content)
+    return doc, [v.findtext('s3:VersionId', namespaces=ns) for v in doc.findall('s3:Version', ns)]
+
+@pytest.mark.versioning
+@pytest.mark.fails_on_aws
+def test_versioning_listv2_versions_token_starts_key_again():
+    # GET /?list-type=2&versions is RGW's own: a ListVersionsResult whose
+    # NextKeyContinuationToken names the last key listed, and no version
+    # token is read back. A page from that token starts at the key's newest
+    # version again, so no version of the key is skipped.
+    bucket_name = get_new_bucket()
+    client = get_client()
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+    for body in ['1', '2', '3']:
+        client.put_object(Bucket=bucket_name, Key='k', Body=body)
+    client.put_object(Bucket=bucket_name, Key='z', Body='z')
+
+    ns = {'s3': 'http://s3.amazonaws.com/doc/2006-03-01/'}
+    doc, first = _raw_version_ids(_get_raw_bucket(bucket_name, 'list-type=2&versions&max-keys=2'))
+    assert len(first) == 2
+    assert doc.findtext('s3:NextKeyContinuationToken', namespaces=ns) == 'k'
+    _, second = _raw_version_ids(_get_raw_bucket(bucket_name, 'list-type=2&versions&max-keys=2&continuation-token=k'))
+    assert second == first
+
 @pytest.mark.fails_on_dbstore
 @pytest.mark.versioning
 def test_versioning_copy_obj_version():
