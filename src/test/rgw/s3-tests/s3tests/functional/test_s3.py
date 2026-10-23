@@ -33,6 +33,7 @@ import pdb
 from collections import namedtuple
 from collections import defaultdict
 from io import BytesIO
+from urllib.parse import unquote_plus
 
 from .utils import assert_raises
 from .utils import generate_random
@@ -263,6 +264,56 @@ def test_bucket_list_encoding_basic():
     prefixes = _get_prefixes(response)
     assert len(prefixes) == 3
     assert prefixes == ['foo%2B1/', 'foo/', 'quux%20ab/']
+
+def _assert_url_encoded(response, sent):
+    # An element S3 encodes under encoding-type=url decodes back to what the
+    # request sent. Each value holds a '+', which decodes to a space when it
+    # comes back as sent. botocore decodes a listing's elements only when it
+    # chose the encoding itself, so a test that names EncodingType reads them
+    # as the gateway wrote them.
+    for element, value in sent.items():
+        assert unquote_plus(response[element]) == value, element
+
+@pytest.mark.fails_on_rgw
+def test_bucket_list_versions_encoding_echo():
+    # S3 returns KeyMarker, Prefix and Delimiter URL-encoded, as it does
+    # NextKeyMarker and each Key. RGW writes the three as they were sent.
+    bucket_name = _create_objects(keys=['d/a+b/1', 'd/a+b/2'])
+    client = get_client()
+
+    sent = {'Prefix': 'd/a+b', 'Delimiter': '+/', 'KeyMarker': 'd/a+b/0'}
+    response = client.list_object_versions(Bucket=bucket_name, EncodingType='url', **sent)
+    assert response['EncodingType'] == 'url'
+    _assert_url_encoded(response, sent)
+    assert [unquote_plus(v['Key']) for v in response['Versions']] == ['d/a+b/1', 'd/a+b/2']
+
+@pytest.mark.list_objects_v2
+@pytest.mark.fails_on_rgw
+def test_bucket_listv2_encoding_echo():
+    # S3 returns ListObjectsV2's Prefix and StartAfter URL-encoded, as it
+    # does Delimiter and each Key. RGW writes the two as they were sent.
+    bucket_name = _create_objects(keys=['d/a+b/1', 'd/a+b/2'])
+    client = get_client()
+
+    sent = {'Prefix': 'd/a+b', 'StartAfter': 'd/a+b/0'}
+    response = client.list_objects_v2(Bucket=bucket_name, EncodingType='url', **sent)
+    assert response['EncodingType'] == 'url'
+    _assert_url_encoded(response, sent)
+    assert [unquote_plus(k) for k in _get_keys(response)] == ['d/a+b/1', 'd/a+b/2']
+
+@pytest.mark.fails_on_rgw
+def test_bucket_list_encoding_marker_echo():
+    # S3's ListObjects reference names no list of encoded elements, but
+    # botocore decodes Marker, as it does Delimiter, NextMarker and each Key,
+    # when it chose encoding-type=url. RGW writes Marker as it was sent.
+    bucket_name = _create_objects(keys=['d/a+b/1', 'd/a+b/2'])
+    client = get_client()
+
+    sent = {'Marker': 'd/a+b/0'}
+    response = client.list_objects(Bucket=bucket_name, EncodingType='url', **sent)
+    assert response['EncodingType'] == 'url'
+    _assert_url_encoded(response, sent)
+    assert [unquote_plus(k) for k in _get_keys(response)] == ['d/a+b/1', 'd/a+b/2']
 
 
 def validate_bucket_list(bucket_name, prefix, delimiter, marker, max_keys,
@@ -7036,6 +7087,27 @@ def test_list_multipart_upload():
     client.abort_multipart_upload(Bucket=bucket_name, Key=key, UploadId=upload_id2)
     client.abort_multipart_upload(Bucket=bucket_name, Key=key2, UploadId=upload_id3)
 
+@pytest.mark.fails_on_rgw
+def test_list_multipart_upload_encoding_echo():
+    # S3 returns ListMultipartUploads' Delimiter, KeyMarker, Prefix,
+    # NextKeyMarker and each Key URL-encoded, and the EncodingType element.
+    # RGW encodes the keys only and writes no EncodingType.
+    bucket_name = get_new_bucket()
+    client = get_client()
+    keys = ['d/a+b/1', 'd/a+b/2']
+    upload_ids = [client.create_multipart_upload(Bucket=bucket_name, Key=k)['UploadId'] for k in keys]
+
+    sent = {'Prefix': 'd/a+b', 'Delimiter': '+/', 'KeyMarker': 'd/a+b/0'}
+    response = client.list_multipart_uploads(Bucket=bucket_name, EncodingType='url', MaxUploads=1, **sent)
+    assert response['IsTruncated'] == True
+    assert response.get('EncodingType') == 'url'
+    _assert_url_encoded(response, sent)
+    _assert_url_encoded(response, {'NextKeyMarker': keys[0]})
+    assert [unquote_plus(u['Key']) for u in response['Uploads']] == keys[:1]
+
+    for key, upload_id in zip(keys, upload_ids):
+        client.abort_multipart_upload(Bucket=bucket_name, Key=key, UploadId=upload_id)
+
 @pytest.mark.fails_on_dbstore
 def test_list_multipart_upload_owner():
     bucket_name = get_new_bucket()
@@ -8688,6 +8760,116 @@ def test_versioning_obj_list_marker():
         assert version['Key'] == key
         check_obj_content(client, bucket_name, key, version['VersionId'], contents[j])
         i += 1
+
+def _page_versions(client, bucket_name, max_keys):
+    # Every version and delete marker, each as (key, version id), paging by
+    # NextKeyMarker and NextVersionIdMarker as S3's reference says. Within a
+    # page the versions come before the delete markers.
+    kwargs = {'Bucket': bucket_name, 'MaxKeys': max_keys}
+    listed = []
+    for _ in range(100):
+        response = client.list_object_versions(**kwargs)
+        entries = response.get('Versions', []) + response.get('DeleteMarkers', [])
+        listed += [(e['Key'], e['VersionId']) for e in entries]
+        if not response['IsTruncated']:
+            return listed
+        kwargs['KeyMarker'] = response['NextKeyMarker']
+        kwargs['VersionIdMarker'] = response['NextVersionIdMarker']
+    assert False, 'the listing never ends'
+
+@pytest.mark.versioning
+def test_versioning_list_versions_paginated():
+    # Paging by the next markers lists every version once, in order, the
+    # null version an object written before versioning leaves included,
+    # which NextVersionIdMarker names null.
+    bucket_name = get_new_bucket()
+    client = get_client()
+    client.put_object(Bucket=bucket_name, Key='k', Body='null')
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+    ids = [client.put_object(Bucket=bucket_name, Key='k', Body=str(i))['VersionId'] for i in range(3)]
+    z = client.put_object(Bucket=bucket_name, Key='z', Body='z')['VersionId']
+
+    want = [('k', i) for i in reversed(ids)] + [('k', 'null'), ('z', z)]
+    for max_keys in [1, 2, 3]:
+        assert _page_versions(client, bucket_name, max_keys) == want, max_keys
+
+    response = client.list_object_versions(Bucket=bucket_name, MaxKeys=4)
+    assert response['NextKeyMarker'] == 'k'
+    assert response['NextVersionIdMarker'] == 'null'
+
+@pytest.mark.versioning
+@pytest.mark.fails_on_rgw
+def test_versioning_list_versions_paginated_null_delete_marker():
+    # On a suspended bucket a delete with no version id writes a null delete
+    # marker. A page that ends on it names it null, and the next page goes
+    # on with the key's older versions. RGW looks for the null version at the
+    # null data key alone, which a delete marker does not have, and starts
+    # past every version of the key.
+    bucket_name = get_new_bucket()
+    client = get_client()
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+    old = client.put_object(Bucket=bucket_name, Key='k', Body='old')['VersionId']
+    check_configure_versioning_retry(bucket_name, "Suspended", "Suspended")
+    client.delete_object(Bucket=bucket_name, Key='k')
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+    new = client.put_object(Bucket=bucket_name, Key='k', Body='new')['VersionId']
+
+    assert _page_versions(client, bucket_name, 1) == [('k', new), ('k', 'null'), ('k', old)]
+
+@pytest.mark.versioning
+@pytest.mark.fails_on_rgw
+def test_versioning_list_versions_key_marker_alone():
+    # A key-marker without a version-id-marker starts after every version of
+    # that key, as the key-marker=key2 sample in S3's ListObjectVersions
+    # reference shows. RGW lists that key's versions again.
+    bucket_name = get_new_bucket()
+    client = get_client()
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+    for key in ['a', 'k', 'z']:
+        for body in ['1', '2']:
+            client.put_object(Bucket=bucket_name, Key=key, Body=body)
+
+    response = client.list_object_versions(Bucket=bucket_name, KeyMarker='k')
+    assert response['KeyMarker'] == 'k'
+    assert [v['Key'] for v in response['Versions']] == ['z', 'z']
+
+def _get_raw_bucket(bucket_name, query):
+    # A GET built and query-signed by hand, for a bucket query boto3 has no
+    # operation for.
+    creds = Credentials(access_key=get_main_aws_access_key(),
+                        secret_key=get_main_aws_secret_key())
+    req = AWSRequest(method='GET',
+                     url=get_config_endpoint() + '/' + bucket_name + '?' + query)
+    S3SigV4QueryAuth(credentials=creds, service_name='s3',
+                     region_name=get_main_api_name(), expires=100).add_auth(req)
+    return requests.get(req.url, verify=get_config_ssl_verify())
+
+def _raw_version_ids(res):
+    assert res.status_code == 200, res.content
+    ns = {'s3': 'http://s3.amazonaws.com/doc/2006-03-01/'}
+    doc = ET.fromstring(res.content)
+    return doc, [v.findtext('s3:VersionId', namespaces=ns) for v in doc.findall('s3:Version', ns)]
+
+@pytest.mark.versioning
+@pytest.mark.fails_on_aws
+def test_versioning_listv2_versions_token_starts_key_again():
+    # GET /?list-type=2&versions is RGW's own: a ListVersionsResult whose
+    # NextKeyContinuationToken names the last key listed, and no version
+    # token is read back. A page from that token starts at the key's newest
+    # version again, so no version of the key is skipped.
+    bucket_name = get_new_bucket()
+    client = get_client()
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+    for body in ['1', '2', '3']:
+        client.put_object(Bucket=bucket_name, Key='k', Body=body)
+    client.put_object(Bucket=bucket_name, Key='z', Body='z')
+
+    ns = {'s3': 'http://s3.amazonaws.com/doc/2006-03-01/'}
+    doc, first = _raw_version_ids(_get_raw_bucket(bucket_name, 'list-type=2&versions&max-keys=2'))
+    assert len(first) == 2
+    assert doc.findtext('s3:NextKeyContinuationToken', namespaces=ns) == 'k'
+    _, second = _raw_version_ids(_get_raw_bucket(bucket_name, 'list-type=2&versions&max-keys=2&continuation-token=k'))
+    assert second == first
 
 @pytest.mark.fails_on_dbstore
 @pytest.mark.versioning
