@@ -8761,6 +8761,42 @@ def test_versioning_obj_list_marker():
         check_obj_content(client, bucket_name, key, version['VersionId'], contents[j])
         i += 1
 
+def _page_versions(client, bucket_name, max_keys):
+    # Every version and delete marker, each as (key, version id), paging by
+    # NextKeyMarker and NextVersionIdMarker as S3's reference says. Within a
+    # page the versions come before the delete markers.
+    kwargs = {'Bucket': bucket_name, 'MaxKeys': max_keys}
+    listed = []
+    for _ in range(100):
+        response = client.list_object_versions(**kwargs)
+        entries = response.get('Versions', []) + response.get('DeleteMarkers', [])
+        listed += [(e['Key'], e['VersionId']) for e in entries]
+        if not response['IsTruncated']:
+            return listed
+        kwargs['KeyMarker'] = response['NextKeyMarker']
+        kwargs['VersionIdMarker'] = response['NextVersionIdMarker']
+    assert False, 'the listing never ends'
+
+@pytest.mark.versioning
+def test_versioning_list_versions_paginated():
+    # Paging by the next markers lists every version once, in order, the
+    # null version an object written before versioning leaves included,
+    # which NextVersionIdMarker names null.
+    bucket_name = get_new_bucket()
+    client = get_client()
+    client.put_object(Bucket=bucket_name, Key='k', Body='null')
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+    ids = [client.put_object(Bucket=bucket_name, Key='k', Body=str(i))['VersionId'] for i in range(3)]
+    z = client.put_object(Bucket=bucket_name, Key='z', Body='z')['VersionId']
+
+    want = [('k', i) for i in reversed(ids)] + [('k', 'null'), ('z', z)]
+    for max_keys in [1, 2, 3]:
+        assert _page_versions(client, bucket_name, max_keys) == want, max_keys
+
+    response = client.list_object_versions(Bucket=bucket_name, MaxKeys=4)
+    assert response['NextKeyMarker'] == 'k'
+    assert response['NextVersionIdMarker'] == 'null'
+
 @pytest.mark.fails_on_dbstore
 @pytest.mark.versioning
 def test_versioning_copy_obj_version():
