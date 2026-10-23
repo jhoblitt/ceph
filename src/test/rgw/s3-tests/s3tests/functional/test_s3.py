@@ -15131,6 +15131,74 @@ def test_object_lock_put_obj_retention_shorten_period_bypass():
 
 
 @pytest.mark.fails_on_dbstore
+def test_object_lock_retention_in_the_past():
+    bucket_name = get_new_bucket_name()
+    client = get_client()
+    client.create_bucket(Bucket=bucket_name, ObjectLockEnabledForBucket=True)
+    key = 'file1'
+    client.put_object(Bucket=bucket_name, Body='abc', Key=key)
+    retention = {'Mode':'GOVERNANCE', 'RetainUntilDate':datetime.datetime(2000,1,1,tzinfo=pytz.UTC)}
+    e = assert_raises(ClientError, client.put_object_retention, Bucket=bucket_name, Key=key, Retention=retention)
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 400
+    assert error_code == 'InvalidArgument'
+    e = assert_raises(ClientError, client.get_object_retention, Bucket=bucket_name, Key=key)
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 404
+
+
+@pytest.mark.fails_on_dbstore
+def test_object_lock_retention_bypass_denied():
+    bucket_name = get_new_bucket_name()
+    client = get_client()
+    client.create_bucket(Bucket=bucket_name, ObjectLockEnabledForBucket=True)
+    key = 'file1'
+    response = client.put_object(Bucket=bucket_name, Body='abc', Key=key)
+    version_id = response['VersionId']
+    retention = {'Mode':'GOVERNANCE', 'RetainUntilDate':datetime.datetime(2030,1,3,tzinfo=pytz.UTC)}
+    client.put_object_retention(Bucket=bucket_name, Key=key, Retention=retention)
+    resource = _make_arn_resource("{}/*".format(bucket_name))
+    policy_document = make_json_policy("s3:BypassGovernanceRetention", resource, effect="Deny")
+    client.put_bucket_policy(Bucket=bucket_name, Policy=policy_document)
+    shorter = {'Mode':'GOVERNANCE', 'RetainUntilDate':datetime.datetime(2030,1,1,tzinfo=pytz.UTC)}
+    e = assert_raises(ClientError, client.put_object_retention, Bucket=bucket_name, Key=key,
+                      Retention=shorter, BypassGovernanceRetention=True)
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 403
+    assert error_code == 'AccessDenied'
+    response = client.get_object_retention(Bucket=bucket_name, Key=key)
+    assert response['Retention'] == retention
+    client.delete_bucket_policy(Bucket=bucket_name)
+    client.delete_object(Bucket=bucket_name, Key=key, VersionId=version_id, BypassGovernanceRetention=True)
+
+
+# TODO: remove fails_on_rgw when RGW stops letting an object ACL's WRITE grant
+# authorize s3:PutObjectRetention and s3:BypassGovernanceRetention:
+# https://github.com/jhoblitt/rgw-go/blob/main/docs/ceph-upstream-bugs.md#radosgw-lets-an-object-acls-write-grant-set-shorten-and-bypass-an-objects-retention-and-legal-hold
+@pytest.mark.fails_on_dbstore
+@pytest.mark.fails_on_rgw
+def test_object_lock_retention_bypass_by_write_grantee():
+    bucket_name = get_new_bucket_name()
+    client = get_client()
+    client.create_bucket(Bucket=bucket_name, ObjectLockEnabledForBucket=True)
+    key = 'file1'
+    response = client.put_object(Bucket=bucket_name, Body='abc', Key=key, ACL='public-read-write')
+    version_id = response['VersionId']
+    retention = {'Mode':'GOVERNANCE', 'RetainUntilDate':datetime.datetime(2030,1,3,tzinfo=pytz.UTC)}
+    client.put_object_retention(Bucket=bucket_name, Key=key, Retention=retention)
+    unauthenticated_client = get_unauthenticated_client()
+    shorter = {'Mode':'GOVERNANCE', 'RetainUntilDate':datetime.datetime(2030,1,1,tzinfo=pytz.UTC)}
+    e = assert_raises(ClientError, unauthenticated_client.put_object_retention, Bucket=bucket_name, Key=key,
+                      Retention=shorter, BypassGovernanceRetention=True)
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 403
+    assert error_code == 'AccessDenied'
+    response = client.get_object_retention(Bucket=bucket_name, Key=key)
+    assert response['Retention'] == retention
+    client.delete_object(Bucket=bucket_name, Key=key, VersionId=version_id, BypassGovernanceRetention=True)
+
+
+@pytest.mark.fails_on_dbstore
 def test_object_lock_delete_object_with_retention():
     bucket_name = get_new_bucket_name()
     client = get_client()
