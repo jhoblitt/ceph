@@ -287,6 +287,20 @@ def test_bucket_list_versions_encoding_echo():
     _assert_url_encoded(response, sent)
     assert [unquote_plus(v['Key']) for v in response['Versions']] == ['d/a+b/1', 'd/a+b/2']
 
+@pytest.mark.list_objects_v2
+@pytest.mark.fails_on_rgw
+def test_bucket_listv2_encoding_echo():
+    # S3 returns ListObjectsV2's Prefix and StartAfter URL-encoded, as it
+    # does Delimiter and each Key. RGW writes the two as they were sent.
+    bucket_name = _create_objects(keys=['d/a+b/1', 'd/a+b/2'])
+    client = get_client()
+
+    sent = {'Prefix': 'd/a+b', 'StartAfter': 'd/a+b/0'}
+    response = client.list_objects_v2(Bucket=bucket_name, EncodingType='url', **sent)
+    assert response['EncodingType'] == 'url'
+    _assert_url_encoded(response, sent)
+    assert [unquote_plus(k) for k in _get_keys(response)] == ['d/a+b/1', 'd/a+b/2']
+
 
 def validate_bucket_list(bucket_name, prefix, delimiter, marker, max_keys,
                          is_truncated, check_objs, check_prefixes, next_marker):
