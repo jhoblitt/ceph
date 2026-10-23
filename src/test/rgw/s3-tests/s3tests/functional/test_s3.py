@@ -66,6 +66,7 @@ from . import (
     get_main_user_id,
     get_main_email,
     get_main_api_name,
+    get_main_mfa_device,
     get_alt_aws_access_key,
     get_alt_aws_secret_key,
     get_alt_display_name,
@@ -8270,6 +8271,45 @@ def test_versioning_bucket_invalid_mfa_delete():
     assert status == 400
     assert error_code == 'MalformedXML'
     assert 'Status' not in client.get_bucket_versioning(Bucket=bucket_name)
+
+def _totp(seed_hex, counter, digits=6):
+    """RFC 6238's TOTP code for counter: RFC 4226's truncation of the
+    HMAC-SHA1 of the big-endian counter."""
+    mac = hmac.new(bytes.fromhex(seed_hex), counter.to_bytes(8, 'big'), hashlib.sha1).digest()
+    offset = mac[-1] & 0x0f
+    value = int.from_bytes(mac[offset:offset + 4], 'big') & 0x7fffffff
+    return str(value % 10 ** digits).zfill(digits)
+
+# TODO: remove fails_on_rgw when https://tracker.ceph.com/issues/80949 is resolved
+@pytest.mark.fails_on_rgw
+def test_versioning_mfa_delete_code_used_once():
+    serial, seed = get_main_mfa_device()
+    bucket_name = get_new_bucket()
+    client = get_client()
+    step = 30
+    # The first change must land in the step its code is computed for.
+    if time.time() % step > step - 5:
+        time.sleep(step - time.time() % step)
+    mfa = '{} {}'.format(serial, _totp(seed, int(time.time()) // step))
+    client.put_bucket_versioning(Bucket=bucket_name, MFA=mfa,
+                                 VersioningConfiguration={'Status': 'Enabled', 'MFADelete': 'Enabled'})
+    assert client.get_bucket_versioning(Bucket=bucket_name)['MFADelete'] == 'Enabled'
+
+    # RFC 6238 section 5.2: a code is accepted once, in its own step and in
+    # the later steps of the device's window alike.
+    disable = {'Status': 'Enabled', 'MFADelete': 'Disabled'}
+    e = assert_raises(ClientError, client.put_bucket_versioning, Bucket=bucket_name, MFA=mfa,
+                      VersioningConfiguration=disable)
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 403
+    assert error_code == 'AccessDenied'
+    time.sleep(step - time.time() % step + 1)
+    e = assert_raises(ClientError, client.put_bucket_versioning, Bucket=bucket_name, MFA=mfa,
+                      VersioningConfiguration=disable)
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 403
+    assert error_code == 'AccessDenied'
+    assert client.get_bucket_versioning(Bucket=bucket_name)['MFADelete'] == 'Enabled'
 
 def check_obj_content(client, bucket_name, key, version_id, content):
     response = client.get_object(Bucket=bucket_name, Key=key, VersionId=version_id)
