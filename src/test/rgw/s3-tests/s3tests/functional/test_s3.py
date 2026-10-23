@@ -9486,6 +9486,43 @@ def test_lifecycle_expiration_versioning_enabled():
 @pytest.mark.lifecycle
 @pytest.mark.lifecycle_expiration
 @pytest.mark.fails_on_aws
+@pytest.mark.fails_on_rgw
+@pytest.mark.versioning
+def test_lifecycle_expiration_versioning_suspended_null_marker():
+    # On a bucket whose versioning is suspended, an Expiration writes a
+    # delete marker with the null version ID, which replaces the null
+    # version and keeps any other version as noncurrent (the S3 User Guide,
+    # "Lifecycle configuration elements", the table "Lifecycle actions and
+    # bucket versioning state"). RGW removes the current version outright,
+    # so the key's next older version becomes current again.
+    bucket_name = get_new_bucket()
+    client = get_client()
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+    null_key = 'test1/null'
+    versioned_key = 'test1/versioned'
+    older = client.put_object(Bucket=bucket_name, Key=null_key, Body='older')['VersionId']
+    kept = client.put_object(Bucket=bucket_name, Key=versioned_key, Body='kept')['VersionId']
+    check_configure_versioning_retry(bucket_name, "Suspended", "Suspended")
+    client.put_object(Bucket=bucket_name, Key=null_key, Body='null')
+
+    rules=[{'ID': 'rule1', 'Expiration': {'Days': 1}, 'Prefix': 'test1/', 'Status':'Enabled'}]
+    lifecycle = {'Rules': rules}
+    client.put_bucket_lifecycle_configuration(Bucket=bucket_name, LifecycleConfiguration=lifecycle)
+
+    lc_interval = get_lc_debug_interval()
+
+    time.sleep(3*lc_interval)
+
+    response = client.list_object_versions(Bucket=bucket_name)
+    versions = {(v['Key'], v['VersionId']): v['IsLatest'] for v in response.get('Versions', [])}
+    delete_markers = {(m['Key'], m['VersionId']): m['IsLatest'] for m in response.get('DeleteMarkers', [])}
+    # the null version is gone, and each key's older version stays noncurrent
+    assert versions == {(null_key, older): False, (versioned_key, kept): False}
+    assert delete_markers == {(null_key, 'null'): True, (versioned_key, 'null'): True}
+
+@pytest.mark.lifecycle
+@pytest.mark.lifecycle_expiration
+@pytest.mark.fails_on_aws
 def test_lifecycle_expiration_tags1():
     bucket_name = get_new_bucket()
     client = get_client()
