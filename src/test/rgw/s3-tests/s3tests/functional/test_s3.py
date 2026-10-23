@@ -33,6 +33,7 @@ import pdb
 from collections import namedtuple
 from collections import defaultdict
 from io import BytesIO
+from urllib.parse import unquote_plus
 
 from .utils import assert_raises
 from .utils import generate_random
@@ -263,6 +264,28 @@ def test_bucket_list_encoding_basic():
     prefixes = _get_prefixes(response)
     assert len(prefixes) == 3
     assert prefixes == ['foo%2B1/', 'foo/', 'quux%20ab/']
+
+def _assert_url_encoded(response, sent):
+    # An element S3 encodes under encoding-type=url decodes back to what the
+    # request sent. Each value holds a '+', which decodes to a space when it
+    # comes back as sent. botocore decodes a listing's elements only when it
+    # chose the encoding itself, so a test that names EncodingType reads them
+    # as the gateway wrote them.
+    for element, value in sent.items():
+        assert unquote_plus(response[element]) == value, element
+
+@pytest.mark.fails_on_rgw
+def test_bucket_list_versions_encoding_echo():
+    # S3 returns KeyMarker, Prefix and Delimiter URL-encoded, as it does
+    # NextKeyMarker and each Key. RGW writes the three as they were sent.
+    bucket_name = _create_objects(keys=['d/a+b/1', 'd/a+b/2'])
+    client = get_client()
+
+    sent = {'Prefix': 'd/a+b', 'Delimiter': '+/', 'KeyMarker': 'd/a+b/0'}
+    response = client.list_object_versions(Bucket=bucket_name, EncodingType='url', **sent)
+    assert response['EncodingType'] == 'url'
+    _assert_url_encoded(response, sent)
+    assert [unquote_plus(v['Key']) for v in response['Versions']] == ['d/a+b/1', 'd/a+b/2']
 
 
 def validate_bucket_list(bucket_name, prefix, delimiter, marker, max_keys,
