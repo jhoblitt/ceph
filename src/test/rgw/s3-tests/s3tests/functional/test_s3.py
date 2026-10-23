@@ -8816,6 +8816,23 @@ def test_versioning_list_versions_paginated_null_delete_marker():
 
     assert _page_versions(client, bucket_name, 1) == [('k', new), ('k', 'null'), ('k', old)]
 
+@pytest.mark.versioning
+@pytest.mark.fails_on_rgw
+def test_versioning_list_versions_key_marker_alone():
+    # A key-marker without a version-id-marker starts after every version of
+    # that key, as the key-marker=key2 sample in S3's ListObjectVersions
+    # reference shows. RGW lists that key's versions again.
+    bucket_name = get_new_bucket()
+    client = get_client()
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+    for key in ['a', 'k', 'z']:
+        for body in ['1', '2']:
+            client.put_object(Bucket=bucket_name, Key=key, Body=body)
+
+    response = client.list_object_versions(Bucket=bucket_name, KeyMarker='k')
+    assert response['KeyMarker'] == 'k'
+    assert [v['Key'] for v in response['Versions']] == ['z', 'z']
+
 @pytest.mark.fails_on_dbstore
 @pytest.mark.versioning
 def test_versioning_copy_obj_version():
