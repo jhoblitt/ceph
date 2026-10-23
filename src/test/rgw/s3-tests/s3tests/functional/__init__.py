@@ -262,6 +262,10 @@ def configure():
     config.main_user_id = cfg.get('s3 main',"user_id")
     config.main_email = cfg.get('s3 main',"email")
     config.main_account_id = cfg.get('s3 main', 'account_id', fallback=None)
+    # A TOTP device of the main user's, as radosgw-admin mfa create makes it
+    # with its default step and window, and its seed in hex.
+    config.main_mfa_serial = cfg.get('s3 main', 'mfa_serial', fallback=None)
+    config.main_mfa_seed = cfg.get('s3 main', 'mfa_seed', fallback=None)
     try:
         config.main_kms_keyid = cfg.get('s3 main',"kms_keyid")
     except (configparser.NoSectionError, configparser.NoOptionError):
@@ -791,6 +795,13 @@ def get_main_account_id():
 
 def get_main_api_name():
     return config.main_api_name
+
+def get_main_mfa_device():
+    """The main user's TOTP device as (serial, hex seed); skips the test
+    when the config names none."""
+    if not config.main_mfa_serial or not config.main_mfa_seed:
+        pytest.skip('[s3 main] names no mfa_serial and mfa_seed')
+    return config.main_mfa_serial, config.main_mfa_seed
 
 def get_main_kms_keyid():
     return config.main_kms_keyid
