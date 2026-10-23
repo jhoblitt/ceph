@@ -7087,6 +7087,27 @@ def test_list_multipart_upload():
     client.abort_multipart_upload(Bucket=bucket_name, Key=key, UploadId=upload_id2)
     client.abort_multipart_upload(Bucket=bucket_name, Key=key2, UploadId=upload_id3)
 
+@pytest.mark.fails_on_rgw
+def test_list_multipart_upload_encoding_echo():
+    # S3 returns ListMultipartUploads' Delimiter, KeyMarker, Prefix,
+    # NextKeyMarker and each Key URL-encoded, and the EncodingType element.
+    # RGW encodes the keys only and writes no EncodingType.
+    bucket_name = get_new_bucket()
+    client = get_client()
+    keys = ['d/a+b/1', 'd/a+b/2']
+    upload_ids = [client.create_multipart_upload(Bucket=bucket_name, Key=k)['UploadId'] for k in keys]
+
+    sent = {'Prefix': 'd/a+b', 'Delimiter': '+/', 'KeyMarker': 'd/a+b/0'}
+    response = client.list_multipart_uploads(Bucket=bucket_name, EncodingType='url', MaxUploads=1, **sent)
+    assert response['IsTruncated'] == True
+    assert response.get('EncodingType') == 'url'
+    _assert_url_encoded(response, sent)
+    _assert_url_encoded(response, {'NextKeyMarker': keys[0]})
+    assert [unquote_plus(u['Key']) for u in response['Uploads']] == keys[:1]
+
+    for key, upload_id in zip(keys, upload_ids):
+        client.abort_multipart_upload(Bucket=bucket_name, Key=key, UploadId=upload_id)
+
 @pytest.mark.fails_on_dbstore
 def test_list_multipart_upload_owner():
     bucket_name = get_new_bucket()
