@@ -22589,6 +22589,50 @@ def test_bucket_create_delete_bucket_ownership():
 
     client.delete_bucket_ownership_controls(Bucket=bucket)
 
+@pytest.mark.object_ownership
+@pytest.mark.fails_on_dbstore
+def test_create_bucket_bucket_owner_enforced_with_public_acl():
+    # S3 takes no ACL beside BucketOwnerEnforced on CreateBucket, and
+    # PutBucketOwnershipControls holds a bucket to the default private ACL
+    # before it sets BucketOwnerEnforced. RGW creates such a bucket.
+    client = get_client()
+    bucket = get_new_bucket_name()
+    e = assert_raises(ClientError, client.create_bucket, Bucket=bucket,
+                      ObjectOwnership='BucketOwnerEnforced', ACL='public-read')
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 400
+    assert error_code == 'InvalidBucketAclWithObjectOwnership'
+    e = assert_raises(ClientError, client.head_bucket, Bucket=bucket)
+    assert _get_status(e.response) == 404
+
+    client.create_bucket(Bucket=bucket, ObjectOwnership='BucketOwnerEnforced', ACL='private')
+    assert 'BucketOwnerEnforced' == get_bucket_ownership(client, bucket)
+
+@pytest.mark.object_ownership
+@pytest.mark.fails_on_dbstore
+def test_bucket_ownership_controls_acl_grantee_denied():
+    # S3 maps a bucket's READ_ACP and WRITE_ACP grants to s3:GetBucketAcl
+    # and s3:PutBucketAcl alone, so neither lets its grantee read, set or
+    # delete the bucket's ownership controls. RGW authorizes them by those
+    # grants. The bucket is created ObjectWriter, so that its ACL can be set
+    # where S3 defaults to BucketOwnerEnforced.
+    client = get_client()
+    bucket = get_new_bucket_name()
+    client.create_bucket(Bucket=bucket, ObjectOwnership='ObjectWriter')
+    alt_client = get_alt_client()
+    client.put_bucket_acl(Bucket=bucket,
+                          GrantFullControl='id=' + get_main_user_id(),
+                          GrantReadACP='id=' + get_alt_user_id(),
+                          GrantWriteACP='id=' + get_alt_user_id())
+    ownership = {'Rules': [{'ObjectOwnership': 'BucketOwnerPreferred'}]}
+    client.put_bucket_ownership_controls(Bucket=bucket, OwnershipControls=ownership)
+
+    check_access_denied(alt_client.get_bucket_ownership_controls, Bucket=bucket)
+    check_access_denied(alt_client.put_bucket_ownership_controls, Bucket=bucket,
+                        OwnershipControls={'Rules': [{'ObjectOwnership': 'ObjectWriter'}]})
+    check_access_denied(alt_client.delete_bucket_ownership_controls, Bucket=bucket)
+    assert 'BucketOwnerPreferred' == get_bucket_ownership(client, bucket)
+
 def test_head_object_404_with_policy_prefix():
     client = get_client()
     bucket = get_new_bucket(client)
