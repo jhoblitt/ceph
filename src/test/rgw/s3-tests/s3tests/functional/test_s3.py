@@ -22539,6 +22539,42 @@ def test_put_object_suspended_if_match():
 @pytest.mark.conditional_write
 @pytest.mark.fails_on_dbstore
 @pytest.mark.versioning
+@pytest.mark.fails_on_rgw
+def test_put_object_versioned_if_none_match_concurrent():
+    # Concurrent If-None-Match: * writes of a new key to a bucket whose
+    # versioning is enabled: at most one succeeds, every other one fails its
+    # precondition or conflicts with a concurrent write, and the key's
+    # versions are those of the writes that succeeded. RGW checks the
+    # condition before its write and links the version unchecked, so
+    # several writes can succeed.
+    client = get_client()
+    bucket = get_new_bucket(client)
+    check_configure_versioning_retry(bucket, "Enabled", "Enabled")
+    key = 'obj'
+    written = []
+    refused = []
+    def put(i):
+        try:
+            response = client.put_object(Bucket=bucket, Key=key, Body=str(i), IfNoneMatch='*')
+            written.append(response['VersionId'])
+        except ClientError as e:
+            refused.append(_get_status_and_error_code(e.response))
+    threads = [threading.Thread(target=put, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(written) <= 1, written
+    assert len(refused) == 8 - len(written), refused
+    refusals = {(412, 'PreconditionFailed'), (409, 'ConditionalRequestConflict')}
+    assert set(refused) <= refusals, refused
+    response = client.list_object_versions(Bucket=bucket)
+    assert sorted(v['VersionId'] for v in response.get('Versions', [])) == sorted(written)
+
+@pytest.mark.conditional_write
+@pytest.mark.fails_on_dbstore
+@pytest.mark.versioning
 def test_multipart_put_object_suspended_if_none_match():
     client = get_client()
     bucket = get_new_bucket(client)
