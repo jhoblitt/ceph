@@ -7498,6 +7498,45 @@ def test_set_cors():
     status = _get_status(e.response)
     assert status == 404
 
+@pytest.mark.fails_on_aws
+@pytest.mark.fails_on_rgw
+def test_bucket_cors_storage_class_checked_after_authorization():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    cors_config ={
+        'CORSRules': [
+            {'AllowedMethods': ['GET'],
+             'AllowedOrigins': ['*'],
+            },
+        ]
+    }
+    client.put_bucket_cors(Bucket=bucket_name, CORSConfiguration=cors_config)
+
+    def add_storage_class(**kwargs):
+        kwargs['params']['headers']['x-amz-storage-class'] = 'NOT_A_STORAGE_CLASS'
+
+    alt_client = get_alt_client()
+    for op, call in [('GetBucketCors', lambda c: c.get_bucket_cors(Bucket=bucket_name)),
+                     ('PutBucketCors', lambda c: c.put_bucket_cors(Bucket=bucket_name, CORSConfiguration=cors_config)),
+                     ('DeleteBucketCors', lambda c: c.delete_bucket_cors(Bucket=bucket_name))]:
+        alt_client.meta.events.register('before-call.s3.' + op, add_storage_class)
+        client.meta.events.register('before-call.s3.' + op, add_storage_class)
+
+        # a requester the bucket refuses learns nothing of its placement
+        e = assert_raises(ClientError, call, alt_client)
+        status, error_code = _get_status_and_error_code(e.response)
+        assert status == 403
+        assert error_code == 'AccessDenied'
+
+        e = assert_raises(ClientError, call, client)
+        status, error_code = _get_status_and_error_code(e.response)
+        assert status == 400
+        assert error_code == 'InvalidArgument'
+
+    # nothing was written or removed
+    response = get_client().get_bucket_cors(Bucket=bucket_name)
+    assert response['CORSRules'][0]['AllowedOrigins'] == ['*']
+
 def _cors_request_and_check(func, url, headers, expect_status, expect_allow_origin, expect_allow_methods):
     r = func(url, headers=headers, verify=get_config_ssl_verify())
     assert r.status_code == expect_status
