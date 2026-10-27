@@ -9250,6 +9250,106 @@ def test_versioning_copy_obj_version():
     assert body == contents[-1]
 
 @pytest.mark.versioning
+@pytest.mark.fails_on_rgw
+def test_versioning_copy_object_version_ids():
+    # A CopyObject into a bucket whose versioning is enabled names the
+    # version it wrote in x-amz-version-id, and in
+    # x-amz-copy-source-version-id the version it read: the one the copy
+    # source names, the current one when it names none, and null for the
+    # null version. RGW sends neither header.
+    client = get_client()
+    src_bucket = get_new_bucket()
+    client.put_object(Bucket=src_bucket, Key='old', Body='old')
+    check_configure_versioning_retry(src_bucket, "Enabled", "Enabled")
+    v1 = client.put_object(Bucket=src_bucket, Key='k', Body='one')['VersionId']
+    v2 = client.put_object(Bucket=src_bucket, Key='k', Body='two')['VersionId']
+    dst_bucket = get_new_bucket()
+    check_configure_versioning_retry(dst_bucket, "Enabled", "Enabled")
+
+    cases = [
+        ({'Bucket': src_bucket, 'Key': 'k', 'VersionId': v1}, v1, 'one'),
+        ({'Bucket': src_bucket, 'Key': 'k'}, v2, 'two'),
+        ({'Bucket': src_bucket, 'Key': 'old'}, 'null', 'old'),
+    ]
+    answers = []
+    for source, _, _ in cases:
+        response = client.copy_object(Bucket=dst_bucket, Key='dst', CopySource=source)
+        answers.append((response.get('CopySourceVersionId'), response.get('VersionId')))
+    got = [(copied, version_id is not None) for copied, version_id in answers]
+    assert got == [(read, True) for _, read, _ in cases], answers
+    written = [version_id for _, version_id in answers]
+    for version_id, (_, _, body) in zip(written, cases):
+        response = client.get_object(Bucket=dst_bucket, Key='dst', VersionId=version_id)
+        assert _get_body(response) == body
+
+    response = client.list_object_versions(Bucket=dst_bucket)
+    assert sorted(v['VersionId'] for v in response['Versions']) == sorted(written)
+
+@pytest.mark.versioning
+@pytest.mark.fails_on_rgw
+def test_versioning_null_version_write_names_null():
+    # A PutObject, a CopyObject and a CompleteMultipartUpload on a bucket
+    # whose versioning is suspended write the null version, and name it in
+    # x-amz-version-id by its id, null. A bucket whose versioning was never
+    # enabled has no versions, and the writes name none. RGW names no
+    # version for the null one.
+    client = get_client()
+    for status in [None, 'Suspended']:
+        bucket_name = get_new_bucket()
+        if status:
+            check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+            check_configure_versioning_retry(bucket_name, status, status)
+        client.put_object(Bucket=bucket_name, Key='src', Body='src')
+        upload_id, parts = prepare_multipart_upload(client, bucket_name, 'mp', 'mp')
+        responses = [
+            client.put_object(Bucket=bucket_name, Key='put', Body='put'),
+            client.copy_object(Bucket=bucket_name, Key='copy', CopySource={'Bucket': bucket_name, 'Key': 'src'}),
+            client.complete_multipart_upload(Bucket=bucket_name, Key='mp', UploadId=upload_id, MultipartUpload={'Parts': parts}),
+        ]
+        want = 'null' if status else None
+        assert [r.get('VersionId') for r in responses] == [want] * 3, status
+
+@pytest.mark.versioning
+@pytest.mark.fails_on_rgw
+def test_versioning_write_version_id_ignored():
+    # PutObject, CopyObject and CompleteMultipartUpload take no versionId,
+    # and a write that names one in its query writes what the bucket's
+    # versioning gives: on a bucket whose versioning was never enabled the
+    # object itself, listed as one null version, and on a suspended bucket
+    # the null version. RGW writes the instance named, and for null on a
+    # bucket never versioned also leaves the object it replaced listed.
+    client = get_client()
+    bucket_name = get_new_bucket()
+    for key in ['put', 'copy', 'mp']:
+        client.put_object(Bucket=bucket_name, Key=key, Body='old')
+    client.put_object(Bucket=bucket_name, Key='src', Body='newer')
+    upload_id, parts = prepare_multipart_upload(client, bucket_name, 'mp', 'newer')
+    suspended_bucket = get_new_bucket()
+    check_configure_versioning_retry(suspended_bucket, "Enabled", "Enabled")
+    check_configure_versioning_retry(suspended_bucket, "Suspended", "Suspended")
+
+    version_id = 'null'
+    def add_version_id(**kwargs):
+        url = kwargs['params']['url']
+        kwargs['params']['url'] = url + ('&' if '?' in url else '?') + 'versionId=' + version_id
+    for event in ['PutObject', 'CopyObject', 'CompleteMultipartUpload']:
+        client.meta.events.register('before-call.s3.' + event, add_version_id)
+
+    client.put_object(Bucket=bucket_name, Key='put', Body='newer')
+    client.copy_object(Bucket=bucket_name, Key='copy', CopySource={'Bucket': bucket_name, 'Key': 'src'})
+    client.complete_multipart_upload(Bucket=bucket_name, Key='mp', UploadId=upload_id, MultipartUpload={'Parts': parts})
+    response = client.list_object_versions(Bucket=bucket_name)
+    listed = sorted((v['Key'], v['VersionId'], v['Size']) for v in response['Versions'])
+    assert listed == [('copy', 'null', 5), ('mp', 'null', 5), ('put', 'null', 5), ('src', 'null', 5)]
+    for key in ['put', 'copy', 'mp']:
+        assert _get_body(client.get_object(Bucket=bucket_name, Key=key)) == 'newer'
+
+    version_id = 'aVersionIdNotWritten'
+    client.put_object(Bucket=suspended_bucket, Key='put', Body='newer')
+    response = client.list_object_versions(Bucket=suspended_bucket)
+    assert [(v['Key'], v['VersionId']) for v in response['Versions']] == [('put', 'null')]
+
+@pytest.mark.versioning
 def test_versioning_multi_object_delete():
     bucket_name = get_new_bucket()
     client = get_client()
@@ -22435,6 +22535,65 @@ def test_put_object_suspended_if_match():
 
     e = assert_raises(ClientError, client.put_object, Bucket=bucket, Key=key, IfNoneMatch='*')
     assert (412, 'PreconditionFailed') == _get_status_and_error_code(e.response)
+
+@pytest.mark.conditional_write
+@pytest.mark.fails_on_dbstore
+@pytest.mark.versioning
+@pytest.mark.fails_on_rgw
+def test_put_object_versioned_if_none_match_concurrent():
+    # Concurrent If-None-Match: * writes of a new key to a bucket whose
+    # versioning is enabled: at most one succeeds, every other one fails its
+    # precondition or conflicts with a concurrent write, and the key's
+    # versions are those of the writes that succeeded. RGW checks the
+    # condition before its write and links the version unchecked, so
+    # several writes can succeed.
+    client = get_client()
+    bucket = get_new_bucket(client)
+    check_configure_versioning_retry(bucket, "Enabled", "Enabled")
+    key = 'obj'
+    written = []
+    refused = []
+    def put(i):
+        try:
+            response = client.put_object(Bucket=bucket, Key=key, Body=str(i), IfNoneMatch='*')
+            written.append(response['VersionId'])
+        except ClientError as e:
+            refused.append(_get_status_and_error_code(e.response))
+    threads = [threading.Thread(target=put, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(written) <= 1, written
+    assert len(refused) == 8 - len(written), refused
+    refusals = {(412, 'PreconditionFailed'), (409, 'ConditionalRequestConflict')}
+    assert set(refused) <= refusals, refused
+    response = client.list_object_versions(Bucket=bucket)
+    assert sorted(v['VersionId'] for v in response.get('Versions', [])) == sorted(written)
+
+@pytest.mark.conditional_write
+@pytest.mark.fails_on_dbstore
+@pytest.mark.versioning
+@pytest.mark.fails_on_rgw
+def test_put_object_suspended_if_match_current_version():
+    # On a bucket whose versioning is suspended, a write's If-Match is
+    # checked against the key's current version, here one with an instance,
+    # and not against the null version the key also holds. RGW checks the
+    # null version, whose data the key's head holds, and answers the
+    # reverse.
+    client = get_client()
+    bucket = get_new_bucket(client)
+    key = 'obj'
+    null_etag = client.put_object(Bucket=bucket, Key=key, Body='null')['ETag']
+    check_configure_versioning_retry(bucket, "Enabled", "Enabled")
+    current_etag = client.put_object(Bucket=bucket, Key=key, Body='current')['ETag']
+    check_configure_versioning_retry(bucket, "Suspended", "Suspended")
+
+    e = assert_raises(ClientError, client.put_object, Bucket=bucket, Key=key, Body='x', IfMatch=null_etag)
+    assert (412, 'PreconditionFailed') == _get_status_and_error_code(e.response)
+    response = client.put_object(Bucket=bucket, Key=key, Body='y', IfMatch=current_etag)
+    assert 200 == response['ResponseMetadata']['HTTPStatusCode']
 
 @pytest.mark.conditional_write
 @pytest.mark.fails_on_dbstore
