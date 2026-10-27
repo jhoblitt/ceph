@@ -9310,6 +9310,46 @@ def test_versioning_null_version_write_names_null():
         assert [r.get('VersionId') for r in responses] == [want] * 3, status
 
 @pytest.mark.versioning
+@pytest.mark.fails_on_rgw
+def test_versioning_write_version_id_ignored():
+    # PutObject, CopyObject and CompleteMultipartUpload take no versionId,
+    # and a write that names one in its query writes what the bucket's
+    # versioning gives: on a bucket whose versioning was never enabled the
+    # object itself, listed as one null version, and on a suspended bucket
+    # the null version. RGW writes the instance named, and for null on a
+    # bucket never versioned also leaves the object it replaced listed.
+    client = get_client()
+    bucket_name = get_new_bucket()
+    for key in ['put', 'copy', 'mp']:
+        client.put_object(Bucket=bucket_name, Key=key, Body='old')
+    client.put_object(Bucket=bucket_name, Key='src', Body='newer')
+    upload_id, parts = prepare_multipart_upload(client, bucket_name, 'mp', 'newer')
+    suspended_bucket = get_new_bucket()
+    check_configure_versioning_retry(suspended_bucket, "Enabled", "Enabled")
+    check_configure_versioning_retry(suspended_bucket, "Suspended", "Suspended")
+
+    version_id = 'null'
+    def add_version_id(**kwargs):
+        url = kwargs['params']['url']
+        kwargs['params']['url'] = url + ('&' if '?' in url else '?') + 'versionId=' + version_id
+    for event in ['PutObject', 'CopyObject', 'CompleteMultipartUpload']:
+        client.meta.events.register('before-call.s3.' + event, add_version_id)
+
+    client.put_object(Bucket=bucket_name, Key='put', Body='newer')
+    client.copy_object(Bucket=bucket_name, Key='copy', CopySource={'Bucket': bucket_name, 'Key': 'src'})
+    client.complete_multipart_upload(Bucket=bucket_name, Key='mp', UploadId=upload_id, MultipartUpload={'Parts': parts})
+    response = client.list_object_versions(Bucket=bucket_name)
+    listed = sorted((v['Key'], v['VersionId'], v['Size']) for v in response['Versions'])
+    assert listed == [('copy', 'null', 5), ('mp', 'null', 5), ('put', 'null', 5), ('src', 'null', 5)]
+    for key in ['put', 'copy', 'mp']:
+        assert _get_body(client.get_object(Bucket=bucket_name, Key=key)) == 'newer'
+
+    version_id = 'aVersionIdNotWritten'
+    client.put_object(Bucket=suspended_bucket, Key='put', Body='newer')
+    response = client.list_object_versions(Bucket=suspended_bucket)
+    assert [(v['Key'], v['VersionId']) for v in response['Versions']] == [('put', 'null')]
+
+@pytest.mark.versioning
 def test_versioning_multi_object_delete():
     bucket_name = get_new_bucket()
     client = get_client()
