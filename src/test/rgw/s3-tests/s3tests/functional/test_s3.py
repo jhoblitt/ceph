@@ -15583,6 +15583,109 @@ def test_object_lock_retention_bypass_by_write_grantee():
     client.delete_object(Bucket=bucket_name, Key=key, VersionId=version_id, BypassGovernanceRetention=True)
 
 
+def _object_lock_bucket_with_default(client, mode, days):
+    bucket_name = get_new_bucket_name()
+    client.create_bucket(Bucket=bucket_name, ObjectLockEnabledForBucket=True)
+    conf = {'ObjectLockEnabled':'Enabled',
+            'Rule': {
+                'DefaultRetention':{
+                    'Mode':mode,
+                    'Days':days
+                }
+            }}
+    client.put_object_lock_configuration(Bucket=bucket_name, ObjectLockConfiguration=conf)
+    return bucket_name
+
+
+# A bucket's default retention dates an object version from its creation.
+# RGW adds the rule's period to the mtime it stamps on the head, which
+# Last-Modified gives cut to the second; Amazon S3 documents the date as the
+# version's creation timestamp plus the period. The tolerance allows for a
+# gateway that takes that timestamp at another moment of the test's requests,
+# as a multipart upload's initiation and completion are, and still tells the
+# default's date from any other.
+_default_retention_tolerance = datetime.timedelta(seconds=5)
+
+
+def _assert_default_retention(client, bucket_name, key, mode, period):
+    response = client.head_object(Bucket=bucket_name, Key=key)
+    version_id = response['VersionId']
+    expected = response['LastModified'] + period
+    response = client.get_object_retention(Bucket=bucket_name, Key=key, VersionId=version_id)
+    assert response['Retention']['Mode'] == mode
+    assert abs(response['Retention']['RetainUntilDate'] - expected) <= _default_retention_tolerance
+    return version_id
+
+
+def _complete_object_lock_upload(client, bucket_name, key, **kwargs):
+    response = client.create_multipart_upload(Bucket=bucket_name, Key=key, **kwargs)
+    upload_id = response['UploadId']
+    response = client.upload_part(UploadId=upload_id, Bucket=bucket_name, Key=key, PartNumber=1, Body='abc')
+    parts = [{'ETag': response['ETag'].strip('"'), 'PartNumber': 1}]
+    client.complete_multipart_upload(Bucket=bucket_name, Key=key, UploadId=upload_id, MultipartUpload={'Parts': parts})
+
+
+@pytest.mark.fails_on_dbstore
+def test_object_lock_default_retention_put_object():
+    client = get_client()
+    bucket_name = _object_lock_bucket_with_default(client, 'GOVERNANCE', 1)
+    key = 'file1'
+    client.put_object(Bucket=bucket_name, Body='abc', Key=key)
+    version_id = _assert_default_retention(client, bucket_name, key, 'GOVERNANCE', datetime.timedelta(days=1))
+    client.delete_object(Bucket=bucket_name, Key=key, VersionId=version_id, BypassGovernanceRetention=True)
+
+
+@pytest.mark.fails_on_dbstore
+def test_object_lock_default_retention_copy_object():
+    client = get_client()
+    bucket_name = _object_lock_bucket_with_default(client, 'GOVERNANCE', 1)
+    source = 'source'
+    response = client.put_object(Bucket=bucket_name, Body='abc', Key=source, ObjectLockMode='GOVERNANCE',
+                                 ObjectLockRetainUntilDate=datetime.datetime(2030,1,1,tzinfo=pytz.UTC))
+    source_version_id = response['VersionId']
+    key = 'copy'
+    client.copy_object(Bucket=bucket_name, Key=key, CopySource={'Bucket': bucket_name, 'Key': source})
+    version_id = _assert_default_retention(client, bucket_name, key, 'GOVERNANCE', datetime.timedelta(days=1))
+    client.delete_object(Bucket=bucket_name, Key=key, VersionId=version_id, BypassGovernanceRetention=True)
+    client.delete_object(Bucket=bucket_name, Key=source, VersionId=source_version_id, BypassGovernanceRetention=True)
+
+
+@pytest.mark.fails_on_dbstore
+def test_object_lock_default_retention_multipart_no_lock():
+    client = get_client()
+    bucket_name = _object_lock_bucket_with_default(client, 'GOVERNANCE', 1)
+    key = 'file1'
+    _complete_object_lock_upload(client, bucket_name, key)
+    version_id = _assert_default_retention(client, bucket_name, key, 'GOVERNANCE', datetime.timedelta(days=1))
+    client.delete_object(Bucket=bucket_name, Key=key, VersionId=version_id, BypassGovernanceRetention=True)
+
+
+@pytest.mark.fails_on_dbstore
+def test_object_lock_default_retention_multipart_upload_retention():
+    client = get_client()
+    bucket_name = _object_lock_bucket_with_default(client, 'GOVERNANCE', 1)
+    key = 'file1'
+    retain_until = datetime.datetime(2030,1,1,tzinfo=pytz.UTC)
+    _complete_object_lock_upload(client, bucket_name, key, ObjectLockMode='GOVERNANCE', ObjectLockRetainUntilDate=retain_until)
+    version_id = client.head_object(Bucket=bucket_name, Key=key)['VersionId']
+    response = client.get_object_retention(Bucket=bucket_name, Key=key, VersionId=version_id)
+    assert response['Retention'] == {'Mode':'GOVERNANCE', 'RetainUntilDate':retain_until}
+    client.delete_object(Bucket=bucket_name, Key=key, VersionId=version_id, BypassGovernanceRetention=True)
+
+
+@pytest.mark.fails_on_dbstore
+def test_object_lock_default_retention_multipart_upload_legal_hold():
+    client = get_client()
+    bucket_name = _object_lock_bucket_with_default(client, 'GOVERNANCE', 1)
+    key = 'file1'
+    _complete_object_lock_upload(client, bucket_name, key, ObjectLockLegalHoldStatus='ON')
+    version_id = _assert_default_retention(client, bucket_name, key, 'GOVERNANCE', datetime.timedelta(days=1))
+    response = client.get_object_legal_hold(Bucket=bucket_name, Key=key, VersionId=version_id)
+    assert response['LegalHold'] == {'Status': 'ON'}
+    client.put_object_legal_hold(Bucket=bucket_name, Key=key, VersionId=version_id, LegalHold={'Status':'OFF'})
+    client.delete_object(Bucket=bucket_name, Key=key, VersionId=version_id, BypassGovernanceRetention=True)
+
+
 @pytest.mark.fails_on_dbstore
 def test_object_lock_delete_object_with_retention():
     bucket_name = get_new_bucket_name()
