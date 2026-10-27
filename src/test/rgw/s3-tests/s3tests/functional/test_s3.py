@@ -7982,6 +7982,27 @@ def test_cors_headers_on_refused_bucket_config_writes():
         assert _get_status(e.response) == 403, op
         assert _cors_response_allow(e.response) == ('example.origin', method), op
 
+@pytest.mark.fails_on_aws
+def test_cors_signed_request_on_wildcard_rule_gets_origin():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    client.put_object(Bucket=bucket_name, Key='foo', Body='bar')
+    cors_config ={
+        'CORSRules': [
+            {'AllowedMethods': ['GET'],
+             'AllowedOrigins': ['*'],
+            },
+        ]
+    }
+    client.put_bucket_cors(Bucket=bucket_name, CORSConfiguration=cors_config)
+
+    time.sleep(3)
+
+    # a request with an Authorization header gets the Origin it sent, not *
+    response = _cors_origin_client(get_client(), 'example.origin').get_object(Bucket=bucket_name, Key='foo')
+    assert _cors_response_allow(response) == ('example.origin', 'GET')
+    assert response['ResponseMetadata']['HTTPHeaders'].get('vary', None) == 'Origin'
+
 @pytest.mark.tagging
 def test_set_bucket_tagging():
     bucket_name = get_new_bucket()
