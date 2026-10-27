@@ -7498,6 +7498,45 @@ def test_set_cors():
     status = _get_status(e.response)
     assert status == 404
 
+@pytest.mark.fails_on_aws
+@pytest.mark.fails_on_rgw
+def test_bucket_cors_storage_class_checked_after_authorization():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    cors_config ={
+        'CORSRules': [
+            {'AllowedMethods': ['GET'],
+             'AllowedOrigins': ['*'],
+            },
+        ]
+    }
+    client.put_bucket_cors(Bucket=bucket_name, CORSConfiguration=cors_config)
+
+    def add_storage_class(**kwargs):
+        kwargs['params']['headers']['x-amz-storage-class'] = 'NOT_A_STORAGE_CLASS'
+
+    alt_client = get_alt_client()
+    for op, call in [('GetBucketCors', lambda c: c.get_bucket_cors(Bucket=bucket_name)),
+                     ('PutBucketCors', lambda c: c.put_bucket_cors(Bucket=bucket_name, CORSConfiguration=cors_config)),
+                     ('DeleteBucketCors', lambda c: c.delete_bucket_cors(Bucket=bucket_name))]:
+        alt_client.meta.events.register('before-call.s3.' + op, add_storage_class)
+        client.meta.events.register('before-call.s3.' + op, add_storage_class)
+
+        # a requester the bucket refuses learns nothing of its placement
+        e = assert_raises(ClientError, call, alt_client)
+        status, error_code = _get_status_and_error_code(e.response)
+        assert status == 403
+        assert error_code == 'AccessDenied'
+
+        e = assert_raises(ClientError, call, client)
+        status, error_code = _get_status_and_error_code(e.response)
+        assert status == 400
+        assert error_code == 'InvalidArgument'
+
+    # nothing was written or removed
+    response = get_client().get_bucket_cors(Bucket=bucket_name)
+    assert response['CORSRules'][0]['AllowedOrigins'] == ['*']
+
 def _cors_request_and_check(func, url, headers, expect_status, expect_allow_origin, expect_allow_methods):
     r = func(url, headers=headers, verify=get_config_ssl_verify())
     assert r.status_code == expect_status
@@ -7631,6 +7670,81 @@ def test_cors_header_option():
 
     _cors_request_and_check(requests.options, obj_url, {'Origin': 'example.origin','Access-Control-Request-Headers':'x-amz-meta-header2','Access-Control-Request-Method':'GET'}, 403, None, None)
 
+@pytest.mark.fails_on_rgw
+def test_cors_preflight_later_rule_allows_method():
+    bucket_name = get_new_bucket()
+    client = get_client()
+
+    cors_config ={
+        'CORSRules': [
+            {'AllowedMethods': ['GET'],
+             'AllowedOrigins': ['example.origin'],
+            },
+            {'AllowedMethods': ['PUT'],
+             'AllowedOrigins': ['example.origin'],
+            },
+        ]
+    }
+
+    client.put_bucket_cors(Bucket=bucket_name, CORSConfiguration=cors_config)
+
+    time.sleep(3)
+
+    url = _get_post_url(bucket_name)
+    obj_url = '{u}/{o}'.format(u=url, o='bar')
+
+    _cors_request_and_check(requests.options, obj_url, {'Origin': 'example.origin', 'Access-Control-Request-Method': 'GET'},
+                            200, 'example.origin', 'GET')
+    # the second rule, the first that allows both the origin and the method
+    _cors_request_and_check(requests.options, obj_url, {'Origin': 'example.origin', 'Access-Control-Request-Method': 'PUT'},
+                            200, 'example.origin', 'PUT')
+    _cors_request_and_check(requests.options, obj_url, {'Origin': 'example.origin', 'Access-Control-Request-Method': 'DELETE'},
+                            403, None, None)
+
+@pytest.mark.fails_on_rgw
+def test_cors_preflight_later_rule_allows_headers():
+    bucket_name = get_new_bucket()
+    client = get_client()
+
+    cors_config ={
+        'CORSRules': [
+            {'AllowedMethods': ['GET'],
+             'AllowedOrigins': ['example.origin'],
+             'AllowedHeaders': ['x-amz-date'],
+            },
+            {'AllowedMethods': ['GET'],
+             'AllowedOrigins': ['example.origin'],
+             'AllowedHeaders': ['x-amz-meta-*'],
+             'ExposeHeaders': ['x-amz-meta-header1'],
+            },
+        ]
+    }
+
+    client.put_bucket_cors(Bucket=bucket_name, CORSConfiguration=cors_config)
+
+    time.sleep(3)
+
+    url = _get_post_url(bucket_name)
+    obj_url = '{u}/{o}'.format(u=url, o='bar')
+
+    r = requests.options(obj_url, headers={'Origin': 'example.origin', 'Access-Control-Request-Method': 'GET',
+                                           'Access-Control-Request-Headers': 'x-amz-date'}, verify=get_config_ssl_verify())
+    assert r.status_code == 200
+    assert r.headers.get('access-control-allow-headers', None) == 'x-amz-date'
+    assert r.headers.get('access-control-expose-headers', None) is None
+
+    # the second rule, the first that allows the origin, the method and the header
+    r = requests.options(obj_url, headers={'Origin': 'example.origin', 'Access-Control-Request-Method': 'GET',
+                                           'Access-Control-Request-Headers': 'x-amz-meta-header2'}, verify=get_config_ssl_verify())
+    assert r.status_code == 200
+    assert r.headers.get('access-control-allow-origin', None) == 'example.origin'
+    assert r.headers.get('access-control-allow-headers', None) == 'x-amz-meta-header2'
+    assert r.headers.get('access-control-expose-headers', None) == 'x-amz-meta-header1'
+
+    _cors_request_and_check(requests.options, obj_url, {'Origin': 'example.origin', 'Access-Control-Request-Method': 'GET',
+                                                        'Access-Control-Request-Headers': 'content-md5'},
+                            403, None, None)
+
 def _test_cors_options_presigned_method(client, method, cannedACL=None):
     bucket_name = _setup_bucket_object_acl('public-read', 'public-read', client=client)
     params = {'Bucket': bucket_name, 'Key': 'foo'}
@@ -7735,6 +7849,190 @@ def test_cors_presigned_put_object_tenant_with_acl():
         method='put_object',
         cannedACL='private',
     )
+
+def _cors_preflight_error_code(r):
+    return ET.fromstring(r.content).find('Code').text
+
+@pytest.mark.fails_on_aws
+def test_cors_presigned_preflight_credentials():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    cors_config ={
+        'CORSRules': [
+            {'AllowedMethods': ['GET'],
+             'AllowedOrigins': ['example'],
+            },
+        ]
+    }
+    client.put_bucket_cors(Bucket=bucket_name, CORSConfiguration=cors_config)
+    params = {'Bucket': bucket_name, 'Key': 'foo'}
+    headers = {'Origin': 'example', 'Access-Control-Request-Method': 'GET'}
+
+    # a preflight's signature is not compared, as a browser's preflight
+    # cannot carry the headers a presigned URL signs; any other request's is
+    forged = get_bad_auth_client(aws_access_key_id=get_main_aws_access_key())
+    url = forged.generate_presigned_url(ClientMethod='get_object', Params=params, ExpiresIn=100000, HttpMethod='GET')
+    _cors_request_and_check(requests.options, url, headers, 200, 'example', 'GET')
+    r = requests.get(url, verify=get_config_ssl_verify())
+    assert r.status_code == 403
+    assert _cors_preflight_error_code(r) == 'SignatureDoesNotMatch'
+
+    # the key must exist
+    unknown = get_bad_auth_client()
+    url = unknown.generate_presigned_url(ClientMethod='get_object', Params=params, ExpiresIn=100000, HttpMethod='GET')
+    r = requests.options(url, headers=headers, verify=get_config_ssl_verify())
+    assert r.status_code == 403
+    assert _cors_preflight_error_code(r) == 'InvalidAccessKeyId'
+
+    # the preflight is signed over the method it asks for, which must be a
+    # CORS method, named in capitals
+    url = client.generate_presigned_url(ClientMethod='get_object', Params=params, ExpiresIn=100000, HttpMethod='GET')
+    for method in ['PATCH', 'get']:
+        r = requests.options(url, headers={'Origin': 'example', 'Access-Control-Request-Method': method},
+                             verify=get_config_ssl_verify())
+        assert r.status_code == 400
+        assert _cors_preflight_error_code(r) == 'InvalidArgument'
+
+@pytest.mark.fails_on_aws
+@pytest.mark.fails_on_rgw
+def test_cors_presigned_v2_preflight_method_refused():
+    bucket_name = get_new_bucket()
+    cors_config ={
+        'CORSRules': [
+            {'AllowedMethods': ['GET'],
+             'AllowedOrigins': ['example'],
+            },
+        ]
+    }
+    get_client().put_bucket_cors(Bucket=bucket_name, CORSConfiguration=cors_config)
+    params = {'Bucket': bucket_name, 'Key': 'foo'}
+    url = get_v2_client().generate_presigned_url(ClientMethod='get_object', Params=params, ExpiresIn=100000, HttpMethod='GET')
+    for method in ['PATCH', 'get']:
+        r = requests.options(url, headers={'Origin': 'example', 'Access-Control-Request-Method': method},
+                             verify=get_config_ssl_verify())
+        assert r.status_code == 400
+        assert _cors_preflight_error_code(r) == 'InvalidArgument'
+
+def _cors_origin_client(client, origin):
+    def add_origin(**kwargs):
+        kwargs['params']['headers']['Origin'] = origin
+    client.meta.events.register('before-call.s3', add_origin)
+    return client
+
+def _cors_response_allow(response):
+    headers = response['ResponseMetadata']['HTTPHeaders']
+    return (headers.get('access-control-allow-origin', None),
+            headers.get('access-control-allow-methods', None))
+
+def _cors_config_write_buckets():
+    client = get_client()
+    bucket_name = get_new_bucket(client)
+    lock_bucket_name = get_new_bucket_name()
+    client.create_bucket(Bucket=lock_bucket_name, ObjectLockEnabledForBucket=True)
+    cors_config ={
+        'CORSRules': [
+            {'AllowedMethods': ['PUT', 'DELETE'],
+             'AllowedOrigins': ['example.origin'],
+            },
+        ]
+    }
+    for name in [bucket_name, lock_bucket_name]:
+        client.put_bucket_cors(Bucket=name, CORSConfiguration=cors_config)
+    time.sleep(3)
+    return bucket_name, lock_bucket_name
+
+def _cors_config_writes(bucket_name, lock_bucket_name):
+    """
+    the bucket configuration writes, each with its method and the status of
+    its success
+    """
+    encryption = {'Rules': [{'ApplyServerSideEncryptionByDefault': {'SSEAlgorithm': 'AES256'}}]}
+    policy = make_json_policy('s3:GetObject', 'arn:aws:s3:::{}/*'.format(bucket_name), effect='Deny')
+    block = {'BlockPublicAcls': True, 'IgnorePublicAcls': True, 'BlockPublicPolicy': True, 'RestrictPublicBuckets': True}
+    lock = {'ObjectLockEnabled': 'Enabled', 'Rule': {'DefaultRetention': {'Mode': 'GOVERNANCE', 'Days': 1}}}
+    return [
+        ('PutBucketEncryption', 'PUT', 200,
+         lambda c: c.put_bucket_encryption(Bucket=bucket_name, ServerSideEncryptionConfiguration=encryption)),
+        ('DeleteBucketEncryption', 'DELETE', 204, lambda c: c.delete_bucket_encryption(Bucket=bucket_name)),
+        ('PutBucketPolicy', 'PUT', 204, lambda c: c.put_bucket_policy(Bucket=bucket_name, Policy=policy)),
+        ('DeleteBucketPolicy', 'DELETE', 204, lambda c: c.delete_bucket_policy(Bucket=bucket_name)),
+        ('PutPublicAccessBlock', 'PUT', 200,
+         lambda c: c.put_public_access_block(Bucket=bucket_name, PublicAccessBlockConfiguration=block)),
+        ('DeletePublicAccessBlock', 'DELETE', 204, lambda c: c.delete_public_access_block(Bucket=bucket_name)),
+        ('PutObjectLockConfiguration', 'PUT', 200,
+         lambda c: c.put_object_lock_configuration(Bucket=lock_bucket_name, ObjectLockConfiguration=lock)),
+    ]
+
+@pytest.mark.fails_on_dbstore
+@pytest.mark.fails_on_rgw
+def test_cors_headers_on_bucket_config_writes():
+    bucket_name, lock_bucket_name = _cors_config_write_buckets()
+    client = _cors_origin_client(get_client(), 'example.origin')
+    for op, method, status, call in _cors_config_writes(bucket_name, lock_bucket_name):
+        response = call(client)
+        assert response['ResponseMetadata']['HTTPStatusCode'] == status, op
+        assert _cors_response_allow(response) == ('example.origin', method), op
+
+@pytest.mark.fails_on_dbstore
+def test_cors_headers_on_refused_bucket_config_writes():
+    bucket_name, lock_bucket_name = _cors_config_write_buckets()
+    alt_client = _cors_origin_client(get_alt_client(), 'example.origin')
+    for op, method, status, call in _cors_config_writes(bucket_name, lock_bucket_name):
+        e = assert_raises(ClientError, call, alt_client)
+        assert _get_status(e.response) == 403, op
+        assert _cors_response_allow(e.response) == ('example.origin', method), op
+
+@pytest.mark.fails_on_aws
+def test_cors_signed_request_on_wildcard_rule_gets_origin():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    client.put_object(Bucket=bucket_name, Key='foo', Body='bar')
+    cors_config ={
+        'CORSRules': [
+            {'AllowedMethods': ['GET'],
+             'AllowedOrigins': ['*'],
+            },
+        ]
+    }
+    client.put_bucket_cors(Bucket=bucket_name, CORSConfiguration=cors_config)
+
+    time.sleep(3)
+
+    # a request with an Authorization header gets the Origin it sent, not *
+    response = _cors_origin_client(get_client(), 'example.origin').get_object(Bucket=bucket_name, Key='foo')
+    assert _cors_response_allow(response) == ('example.origin', 'GET')
+    assert response['ResponseMetadata']['HTTPHeaders'].get('vary', None) == 'Origin'
+
+@pytest.mark.fails_on_rgw
+def test_cors_headers_on_delete_objects_refusal():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    cors_config ={
+        'CORSRules': [
+            {'AllowedMethods': ['POST'],
+             'AllowedOrigins': ['example.origin'],
+            },
+        ]
+    }
+    client.put_bucket_cors(Bucket=bucket_name, CORSConfiguration=cors_config)
+
+    time.sleep(3)
+
+    # a body built and query-signed by hand, which boto3 would not write
+    body = '<Delete><Object><Key>foo</Key>'
+    creds = Credentials(access_key=get_main_aws_access_key(),
+                        secret_key=get_main_aws_secret_key())
+    req = AWSRequest(method='POST', url=get_config_endpoint() + '/' + bucket_name + '?delete')
+    S3SigV4QueryAuth(credentials=creds, service_name='s3',
+                     region_name=get_main_api_name(), expires=100).add_auth(req)
+    content_md5 = base64.b64encode(hashlib.md5(body.encode()).digest()).decode()
+    r = requests.post(req.url, data=body, headers={'Content-MD5': content_md5, 'Origin': 'example.origin'},
+                      verify=get_config_ssl_verify())
+    # RGW's 400 is its status line alone, from an error that differs by
+    # release, so only the status and the headers are asserted
+    assert r.status_code == 400
+    assert r.headers.get('access-control-allow-origin', None) == 'example.origin'
+    assert r.headers.get('access-control-allow-methods', None) == 'POST'
 
 @pytest.mark.tagging
 def test_set_bucket_tagging():
