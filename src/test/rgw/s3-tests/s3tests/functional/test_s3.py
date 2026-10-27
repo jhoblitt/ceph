@@ -13803,6 +13803,56 @@ def test_set_multipart_tagging():
   response = client.get_object_tagging(Bucket=bucket_name, Key=key)
   assert len(response['TagSet']) == 0
 
+def _with_layout(client, operation):
+    # GET ?layout is RGW's RGWGetObjLayout, which boto3 has no operation
+    # for: operation's request with the layout parameter added to its url,
+    # before the url is signed.
+    def add_layout(params, **kwargs):
+        url = params['url']
+        params['url'] = url + ('&' if '?' in url else '?') + 'layout'
+    client.meta.events.register('before-call.s3.' + operation, add_layout)
+    return client
+
+@pytest.mark.fails_on_aws
+def test_get_obj_layout_refused_without_admin_cap():
+    # RGW authorizes ?layout by the requester's admin=read cap alone, so the
+    # bucket's owner, who holds no cap, is refused its own object's layout.
+    # RGW's op_get takes ?layout before ?tagging, so the refusal holds when
+    # both are named.
+    bucket_name = get_new_bucket()
+    client = get_client()
+    client.put_object(Bucket=bucket_name, Key='foo', Body='bar')
+
+    layout_client = _with_layout(get_client(), 'GetObject')
+    e = assert_raises(ClientError, layout_client.get_object, Bucket=bucket_name, Key='foo')
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 403
+    assert error_code == 'AccessDenied'
+
+    tagging_client = _with_layout(get_client(), 'GetObjectTagging')
+    e = assert_raises(ClientError, tagging_client.get_object_tagging, Bucket=bucket_name, Key='foo')
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 403
+    assert error_code == 'AccessDenied'
+
+def test_get_obj_layout_missing_object():
+    # RGW reads the object before it checks the cap, so a missing key is
+    # NoSuchKey to the bucket's owner, who may list the bucket, and
+    # AccessDenied to another user, who may not.
+    bucket_name = get_new_bucket()
+
+    client = _with_layout(get_client(), 'GetObject')
+    e = assert_raises(ClientError, client.get_object, Bucket=bucket_name, Key='foo')
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 404
+    assert error_code == 'NoSuchKey'
+
+    alt_client = _with_layout(get_alt_client(), 'GetObject')
+    e = assert_raises(ClientError, alt_client.get_object, Bucket=bucket_name, Key='foo')
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 403
+    assert error_code == 'AccessDenied'
+
 @pytest.mark.tagging
 @pytest.mark.fails_on_dbstore
 def test_get_obj_tagging():
