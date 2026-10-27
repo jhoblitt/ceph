@@ -8034,6 +8034,60 @@ def test_cors_headers_on_delete_objects_refusal():
     assert r.headers.get('access-control-allow-origin', None) == 'example.origin'
     assert r.headers.get('access-control-allow-methods', None) == 'POST'
 
+def _cors_headers_client(client, headers):
+    def add_headers(**kwargs):
+        kwargs['params']['headers'].update(headers)
+    client.meta.events.register('before-call.s3', add_headers)
+    return client
+
+@pytest.mark.fails_on_aws
+@pytest.mark.fails_on_rgw
+def test_cors_non_preflight_origin_refused():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    client.put_object(Bucket=bucket_name, Key='foo', Body='bar')
+    cors_config ={
+        'CORSRules': [
+            {'AllowedMethods': ['GET'],
+             'AllowedOrigins': ['*'],
+            },
+            {'AllowedMethods': ['PUT'],
+             'AllowedOrigins': ['example.writer'],
+            },
+        ]
+    }
+    client.put_bucket_cors(Bucket=bucket_name, CORSConfiguration=cors_config)
+
+    time.sleep(3)
+
+    # the bucket owner's PUT from an origin no rule lets PUT is refused,
+    # though the owner may write, and nothing is written
+    reader = _cors_origin_client(get_client(), 'example.reader')
+    e = assert_raises(ClientError, reader.put_object, Bucket=bucket_name, Key='baz', Body='bar')
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 403
+    assert error_code == 'AccessDenied'
+    e = assert_raises(ClientError, client.head_object, Bucket=bucket_name, Key='baz')
+    assert _get_status(e.response) == 404
+
+    # the request's own method is matched, not Access-Control-Request-Method
+    asks_get = _cors_headers_client(get_client(), {'Origin': 'example.reader', 'Access-Control-Request-Method': 'GET'})
+    e = assert_raises(ClientError, asks_get.put_object, Bucket=bucket_name, Key='baz', Body='bar')
+    assert _get_status(e.response) == 403
+    asks_put = _cors_headers_client(get_client(), {'Origin': 'example.reader', 'Access-Control-Request-Method': 'PUT'})
+    response = asks_put.get_object(Bucket=bucket_name, Key='foo')
+    assert _get_body(response) == 'bar'
+
+    # a GET from that origin, which a rule allows, is served
+    response = reader.get_object(Bucket=bucket_name, Key='foo')
+    assert _get_body(response) == 'bar'
+    assert _cors_response_allow(response) == ('example.reader', 'GET')
+
+    # the origin a rule lets PUT writes
+    writer = _cors_origin_client(get_client(), 'example.writer')
+    writer.put_object(Bucket=bucket_name, Key='baz', Body='bar')
+    assert _get_body(client.get_object(Bucket=bucket_name, Key='baz')) == 'bar'
+
 @pytest.mark.tagging
 def test_set_bucket_tagging():
     bucket_name = get_new_bucket()
