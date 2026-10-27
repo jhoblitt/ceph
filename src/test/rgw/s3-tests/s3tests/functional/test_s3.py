@@ -7850,6 +7850,69 @@ def test_cors_presigned_put_object_tenant_with_acl():
         cannedACL='private',
     )
 
+def _cors_preflight_error_code(r):
+    return ET.fromstring(r.content).find('Code').text
+
+@pytest.mark.fails_on_aws
+def test_cors_presigned_preflight_credentials():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    cors_config ={
+        'CORSRules': [
+            {'AllowedMethods': ['GET'],
+             'AllowedOrigins': ['example'],
+            },
+        ]
+    }
+    client.put_bucket_cors(Bucket=bucket_name, CORSConfiguration=cors_config)
+    params = {'Bucket': bucket_name, 'Key': 'foo'}
+    headers = {'Origin': 'example', 'Access-Control-Request-Method': 'GET'}
+
+    # a preflight's signature is not compared, as a browser's preflight
+    # cannot carry the headers a presigned URL signs; any other request's is
+    forged = get_bad_auth_client(aws_access_key_id=get_main_aws_access_key())
+    url = forged.generate_presigned_url(ClientMethod='get_object', Params=params, ExpiresIn=100000, HttpMethod='GET')
+    _cors_request_and_check(requests.options, url, headers, 200, 'example', 'GET')
+    r = requests.get(url, verify=get_config_ssl_verify())
+    assert r.status_code == 403
+    assert _cors_preflight_error_code(r) == 'SignatureDoesNotMatch'
+
+    # the key must exist
+    unknown = get_bad_auth_client()
+    url = unknown.generate_presigned_url(ClientMethod='get_object', Params=params, ExpiresIn=100000, HttpMethod='GET')
+    r = requests.options(url, headers=headers, verify=get_config_ssl_verify())
+    assert r.status_code == 403
+    assert _cors_preflight_error_code(r) == 'InvalidAccessKeyId'
+
+    # the preflight is signed over the method it asks for, which must be a
+    # CORS method, named in capitals
+    url = client.generate_presigned_url(ClientMethod='get_object', Params=params, ExpiresIn=100000, HttpMethod='GET')
+    for method in ['PATCH', 'get']:
+        r = requests.options(url, headers={'Origin': 'example', 'Access-Control-Request-Method': method},
+                             verify=get_config_ssl_verify())
+        assert r.status_code == 400
+        assert _cors_preflight_error_code(r) == 'InvalidArgument'
+
+@pytest.mark.fails_on_aws
+@pytest.mark.fails_on_rgw
+def test_cors_presigned_v2_preflight_method_refused():
+    bucket_name = get_new_bucket()
+    cors_config ={
+        'CORSRules': [
+            {'AllowedMethods': ['GET'],
+             'AllowedOrigins': ['example'],
+            },
+        ]
+    }
+    get_client().put_bucket_cors(Bucket=bucket_name, CORSConfiguration=cors_config)
+    params = {'Bucket': bucket_name, 'Key': 'foo'}
+    url = get_v2_client().generate_presigned_url(ClientMethod='get_object', Params=params, ExpiresIn=100000, HttpMethod='GET')
+    for method in ['PATCH', 'get']:
+        r = requests.options(url, headers={'Origin': 'example', 'Access-Control-Request-Method': method},
+                             verify=get_config_ssl_verify())
+        assert r.status_code == 400
+        assert _cors_preflight_error_code(r) == 'InvalidArgument'
+
 @pytest.mark.tagging
 def test_set_bucket_tagging():
     bucket_name = get_new_bucket()
