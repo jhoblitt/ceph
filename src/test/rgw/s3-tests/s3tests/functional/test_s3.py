@@ -9286,6 +9286,30 @@ def test_versioning_copy_object_version_ids():
     assert sorted(v['VersionId'] for v in response['Versions']) == sorted(written)
 
 @pytest.mark.versioning
+@pytest.mark.fails_on_rgw
+def test_versioning_null_version_write_names_null():
+    # A PutObject, a CopyObject and a CompleteMultipartUpload on a bucket
+    # whose versioning is suspended write the null version, and name it in
+    # x-amz-version-id by its id, null. A bucket whose versioning was never
+    # enabled has no versions, and the writes name none. RGW names no
+    # version for the null one.
+    client = get_client()
+    for status in [None, 'Suspended']:
+        bucket_name = get_new_bucket()
+        if status:
+            check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+            check_configure_versioning_retry(bucket_name, status, status)
+        client.put_object(Bucket=bucket_name, Key='src', Body='src')
+        upload_id, parts = prepare_multipart_upload(client, bucket_name, 'mp', 'mp')
+        responses = [
+            client.put_object(Bucket=bucket_name, Key='put', Body='put'),
+            client.copy_object(Bucket=bucket_name, Key='copy', CopySource={'Bucket': bucket_name, 'Key': 'src'}),
+            client.complete_multipart_upload(Bucket=bucket_name, Key='mp', UploadId=upload_id, MultipartUpload={'Parts': parts}),
+        ]
+        want = 'null' if status else None
+        assert [r.get('VersionId') for r in responses] == [want] * 3, status
+
+@pytest.mark.versioning
 def test_versioning_multi_object_delete():
     bucket_name = get_new_bucket()
     client = get_client()
