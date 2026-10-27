@@ -7973,6 +7973,15 @@ def test_cors_headers_on_bucket_config_writes():
         assert response['ResponseMetadata']['HTTPStatusCode'] == status, op
         assert _cors_response_allow(response) == ('example.origin', method), op
 
+@pytest.mark.fails_on_dbstore
+def test_cors_headers_on_refused_bucket_config_writes():
+    bucket_name, lock_bucket_name = _cors_config_write_buckets()
+    alt_client = _cors_origin_client(get_alt_client(), 'example.origin')
+    for op, method, status, call in _cors_config_writes(bucket_name, lock_bucket_name):
+        e = assert_raises(ClientError, call, alt_client)
+        assert _get_status(e.response) == 403, op
+        assert _cors_response_allow(e.response) == ('example.origin', method), op
+
 @pytest.mark.tagging
 def test_set_bucket_tagging():
     bucket_name = get_new_bucket()
