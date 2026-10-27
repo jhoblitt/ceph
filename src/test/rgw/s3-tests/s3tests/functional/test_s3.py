@@ -9250,6 +9250,42 @@ def test_versioning_copy_obj_version():
     assert body == contents[-1]
 
 @pytest.mark.versioning
+@pytest.mark.fails_on_rgw
+def test_versioning_copy_object_version_ids():
+    # A CopyObject into a bucket whose versioning is enabled names the
+    # version it wrote in x-amz-version-id, and in
+    # x-amz-copy-source-version-id the version it read: the one the copy
+    # source names, the current one when it names none, and null for the
+    # null version. RGW sends neither header.
+    client = get_client()
+    src_bucket = get_new_bucket()
+    client.put_object(Bucket=src_bucket, Key='old', Body='old')
+    check_configure_versioning_retry(src_bucket, "Enabled", "Enabled")
+    v1 = client.put_object(Bucket=src_bucket, Key='k', Body='one')['VersionId']
+    v2 = client.put_object(Bucket=src_bucket, Key='k', Body='two')['VersionId']
+    dst_bucket = get_new_bucket()
+    check_configure_versioning_retry(dst_bucket, "Enabled", "Enabled")
+
+    cases = [
+        ({'Bucket': src_bucket, 'Key': 'k', 'VersionId': v1}, v1, 'one'),
+        ({'Bucket': src_bucket, 'Key': 'k'}, v2, 'two'),
+        ({'Bucket': src_bucket, 'Key': 'old'}, 'null', 'old'),
+    ]
+    answers = []
+    for source, _, _ in cases:
+        response = client.copy_object(Bucket=dst_bucket, Key='dst', CopySource=source)
+        answers.append((response.get('CopySourceVersionId'), response.get('VersionId')))
+    got = [(copied, version_id is not None) for copied, version_id in answers]
+    assert got == [(read, True) for _, read, _ in cases], answers
+    written = [version_id for _, version_id in answers]
+    for version_id, (_, _, body) in zip(written, cases):
+        response = client.get_object(Bucket=dst_bucket, Key='dst', VersionId=version_id)
+        assert _get_body(response) == body
+
+    response = client.list_object_versions(Bucket=dst_bucket)
+    assert sorted(v['VersionId'] for v in response['Versions']) == sorted(written)
+
+@pytest.mark.versioning
 def test_versioning_multi_object_delete():
     bucket_name = get_new_bucket()
     client = get_client()
