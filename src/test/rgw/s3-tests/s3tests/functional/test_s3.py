@@ -22575,6 +22575,29 @@ def test_put_object_versioned_if_none_match_concurrent():
 @pytest.mark.conditional_write
 @pytest.mark.fails_on_dbstore
 @pytest.mark.versioning
+@pytest.mark.fails_on_rgw
+def test_put_object_suspended_if_match_current_version():
+    # On a bucket whose versioning is suspended, a write's If-Match is
+    # checked against the key's current version, here one with an instance,
+    # and not against the null version the key also holds. RGW checks the
+    # null version, whose data the key's head holds, and answers the
+    # reverse.
+    client = get_client()
+    bucket = get_new_bucket(client)
+    key = 'obj'
+    null_etag = client.put_object(Bucket=bucket, Key=key, Body='null')['ETag']
+    check_configure_versioning_retry(bucket, "Enabled", "Enabled")
+    current_etag = client.put_object(Bucket=bucket, Key=key, Body='current')['ETag']
+    check_configure_versioning_retry(bucket, "Suspended", "Suspended")
+
+    e = assert_raises(ClientError, client.put_object, Bucket=bucket, Key=key, Body='x', IfMatch=null_etag)
+    assert (412, 'PreconditionFailed') == _get_status_and_error_code(e.response)
+    response = client.put_object(Bucket=bucket, Key=key, Body='y', IfMatch=current_etag)
+    assert 200 == response['ResponseMetadata']['HTTPStatusCode']
+
+@pytest.mark.conditional_write
+@pytest.mark.fails_on_dbstore
+@pytest.mark.versioning
 def test_multipart_put_object_suspended_if_none_match():
     client = get_client()
     bucket = get_new_bucket(client)
