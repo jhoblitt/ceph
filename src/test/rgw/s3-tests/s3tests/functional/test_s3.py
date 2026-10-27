@@ -8003,6 +8003,37 @@ def test_cors_signed_request_on_wildcard_rule_gets_origin():
     assert _cors_response_allow(response) == ('example.origin', 'GET')
     assert response['ResponseMetadata']['HTTPHeaders'].get('vary', None) == 'Origin'
 
+@pytest.mark.fails_on_rgw
+def test_cors_headers_on_delete_objects_refusal():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    cors_config ={
+        'CORSRules': [
+            {'AllowedMethods': ['POST'],
+             'AllowedOrigins': ['example.origin'],
+            },
+        ]
+    }
+    client.put_bucket_cors(Bucket=bucket_name, CORSConfiguration=cors_config)
+
+    time.sleep(3)
+
+    # a body built and query-signed by hand, which boto3 would not write
+    body = '<Delete><Object><Key>foo</Key>'
+    creds = Credentials(access_key=get_main_aws_access_key(),
+                        secret_key=get_main_aws_secret_key())
+    req = AWSRequest(method='POST', url=get_config_endpoint() + '/' + bucket_name + '?delete')
+    S3SigV4QueryAuth(credentials=creds, service_name='s3',
+                     region_name=get_main_api_name(), expires=100).add_auth(req)
+    content_md5 = base64.b64encode(hashlib.md5(body.encode()).digest()).decode()
+    r = requests.post(req.url, data=body, headers={'Content-MD5': content_md5, 'Origin': 'example.origin'},
+                      verify=get_config_ssl_verify())
+    # RGW's 400 is its status line alone, from an error that differs by
+    # release, so only the status and the headers are asserted
+    assert r.status_code == 400
+    assert r.headers.get('access-control-allow-origin', None) == 'example.origin'
+    assert r.headers.get('access-control-allow-methods', None) == 'POST'
+
 @pytest.mark.tagging
 def test_set_bucket_tagging():
     bucket_name = get_new_bucket()
