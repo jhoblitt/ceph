@@ -7631,6 +7631,81 @@ def test_cors_header_option():
 
     _cors_request_and_check(requests.options, obj_url, {'Origin': 'example.origin','Access-Control-Request-Headers':'x-amz-meta-header2','Access-Control-Request-Method':'GET'}, 403, None, None)
 
+@pytest.mark.fails_on_rgw
+def test_cors_preflight_later_rule_allows_method():
+    bucket_name = get_new_bucket()
+    client = get_client()
+
+    cors_config ={
+        'CORSRules': [
+            {'AllowedMethods': ['GET'],
+             'AllowedOrigins': ['example.origin'],
+            },
+            {'AllowedMethods': ['PUT'],
+             'AllowedOrigins': ['example.origin'],
+            },
+        ]
+    }
+
+    client.put_bucket_cors(Bucket=bucket_name, CORSConfiguration=cors_config)
+
+    time.sleep(3)
+
+    url = _get_post_url(bucket_name)
+    obj_url = '{u}/{o}'.format(u=url, o='bar')
+
+    _cors_request_and_check(requests.options, obj_url, {'Origin': 'example.origin', 'Access-Control-Request-Method': 'GET'},
+                            200, 'example.origin', 'GET')
+    # the second rule, the first that allows both the origin and the method
+    _cors_request_and_check(requests.options, obj_url, {'Origin': 'example.origin', 'Access-Control-Request-Method': 'PUT'},
+                            200, 'example.origin', 'PUT')
+    _cors_request_and_check(requests.options, obj_url, {'Origin': 'example.origin', 'Access-Control-Request-Method': 'DELETE'},
+                            403, None, None)
+
+@pytest.mark.fails_on_rgw
+def test_cors_preflight_later_rule_allows_headers():
+    bucket_name = get_new_bucket()
+    client = get_client()
+
+    cors_config ={
+        'CORSRules': [
+            {'AllowedMethods': ['GET'],
+             'AllowedOrigins': ['example.origin'],
+             'AllowedHeaders': ['x-amz-date'],
+            },
+            {'AllowedMethods': ['GET'],
+             'AllowedOrigins': ['example.origin'],
+             'AllowedHeaders': ['x-amz-meta-*'],
+             'ExposeHeaders': ['x-amz-meta-header1'],
+            },
+        ]
+    }
+
+    client.put_bucket_cors(Bucket=bucket_name, CORSConfiguration=cors_config)
+
+    time.sleep(3)
+
+    url = _get_post_url(bucket_name)
+    obj_url = '{u}/{o}'.format(u=url, o='bar')
+
+    r = requests.options(obj_url, headers={'Origin': 'example.origin', 'Access-Control-Request-Method': 'GET',
+                                           'Access-Control-Request-Headers': 'x-amz-date'}, verify=get_config_ssl_verify())
+    assert r.status_code == 200
+    assert r.headers.get('access-control-allow-headers', None) == 'x-amz-date'
+    assert r.headers.get('access-control-expose-headers', None) is None
+
+    # the second rule, the first that allows the origin, the method and the header
+    r = requests.options(obj_url, headers={'Origin': 'example.origin', 'Access-Control-Request-Method': 'GET',
+                                           'Access-Control-Request-Headers': 'x-amz-meta-header2'}, verify=get_config_ssl_verify())
+    assert r.status_code == 200
+    assert r.headers.get('access-control-allow-origin', None) == 'example.origin'
+    assert r.headers.get('access-control-allow-headers', None) == 'x-amz-meta-header2'
+    assert r.headers.get('access-control-expose-headers', None) == 'x-amz-meta-header1'
+
+    _cors_request_and_check(requests.options, obj_url, {'Origin': 'example.origin', 'Access-Control-Request-Method': 'GET',
+                                                        'Access-Control-Request-Headers': 'content-md5'},
+                            403, None, None)
+
 def _test_cors_options_presigned_method(client, method, cannedACL=None):
     bucket_name = _setup_bucket_object_acl('public-read', 'public-read', client=client)
     params = {'Bucket': bucket_name, 'Key': 'foo'}
