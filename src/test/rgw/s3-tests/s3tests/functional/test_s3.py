@@ -7913,6 +7913,66 @@ def test_cors_presigned_v2_preflight_method_refused():
         assert r.status_code == 400
         assert _cors_preflight_error_code(r) == 'InvalidArgument'
 
+def _cors_origin_client(client, origin):
+    def add_origin(**kwargs):
+        kwargs['params']['headers']['Origin'] = origin
+    client.meta.events.register('before-call.s3', add_origin)
+    return client
+
+def _cors_response_allow(response):
+    headers = response['ResponseMetadata']['HTTPHeaders']
+    return (headers.get('access-control-allow-origin', None),
+            headers.get('access-control-allow-methods', None))
+
+def _cors_config_write_buckets():
+    client = get_client()
+    bucket_name = get_new_bucket(client)
+    lock_bucket_name = get_new_bucket_name()
+    client.create_bucket(Bucket=lock_bucket_name, ObjectLockEnabledForBucket=True)
+    cors_config ={
+        'CORSRules': [
+            {'AllowedMethods': ['PUT', 'DELETE'],
+             'AllowedOrigins': ['example.origin'],
+            },
+        ]
+    }
+    for name in [bucket_name, lock_bucket_name]:
+        client.put_bucket_cors(Bucket=name, CORSConfiguration=cors_config)
+    time.sleep(3)
+    return bucket_name, lock_bucket_name
+
+def _cors_config_writes(bucket_name, lock_bucket_name):
+    """
+    the bucket configuration writes, each with its method and the status of
+    its success
+    """
+    encryption = {'Rules': [{'ApplyServerSideEncryptionByDefault': {'SSEAlgorithm': 'AES256'}}]}
+    policy = make_json_policy('s3:GetObject', 'arn:aws:s3:::{}/*'.format(bucket_name), effect='Deny')
+    block = {'BlockPublicAcls': True, 'IgnorePublicAcls': True, 'BlockPublicPolicy': True, 'RestrictPublicBuckets': True}
+    lock = {'ObjectLockEnabled': 'Enabled', 'Rule': {'DefaultRetention': {'Mode': 'GOVERNANCE', 'Days': 1}}}
+    return [
+        ('PutBucketEncryption', 'PUT', 200,
+         lambda c: c.put_bucket_encryption(Bucket=bucket_name, ServerSideEncryptionConfiguration=encryption)),
+        ('DeleteBucketEncryption', 'DELETE', 204, lambda c: c.delete_bucket_encryption(Bucket=bucket_name)),
+        ('PutBucketPolicy', 'PUT', 204, lambda c: c.put_bucket_policy(Bucket=bucket_name, Policy=policy)),
+        ('DeleteBucketPolicy', 'DELETE', 204, lambda c: c.delete_bucket_policy(Bucket=bucket_name)),
+        ('PutPublicAccessBlock', 'PUT', 200,
+         lambda c: c.put_public_access_block(Bucket=bucket_name, PublicAccessBlockConfiguration=block)),
+        ('DeletePublicAccessBlock', 'DELETE', 204, lambda c: c.delete_public_access_block(Bucket=bucket_name)),
+        ('PutObjectLockConfiguration', 'PUT', 200,
+         lambda c: c.put_object_lock_configuration(Bucket=lock_bucket_name, ObjectLockConfiguration=lock)),
+    ]
+
+@pytest.mark.fails_on_dbstore
+@pytest.mark.fails_on_rgw
+def test_cors_headers_on_bucket_config_writes():
+    bucket_name, lock_bucket_name = _cors_config_write_buckets()
+    client = _cors_origin_client(get_client(), 'example.origin')
+    for op, method, status, call in _cors_config_writes(bucket_name, lock_bucket_name):
+        response = call(client)
+        assert response['ResponseMetadata']['HTTPStatusCode'] == status, op
+        assert _cors_response_allow(response) == ('example.origin', method), op
+
 @pytest.mark.tagging
 def test_set_bucket_tagging():
     bucket_name = get_new_bucket()
