@@ -9467,6 +9467,28 @@ def test_versioning_read_delete_marker_version():
                 assert 'last-modified' in headers, (name, version_id)
 
 @pytest.mark.versioning
+@pytest.mark.fails_on_rgw
+def test_versioning_copy_object_source_delete_marker_version():
+    # A CopyObject whose source names a delete marker's version answers 400
+    # Bad Request, as one may not copy a delete marker, and writes nothing.
+    # A source whose current version is a delete marker, named by no
+    # version, answers 404. RGW answers both 404 NoSuchKey.
+    client = get_client()
+    bucket = get_new_bucket()
+    check_configure_versioning_retry(bucket, "Enabled", "Enabled")
+    client.put_object(Bucket=bucket, Key='src', Body='one')
+    marker = client.delete_object(Bucket=bucket, Key='src')
+    assert marker['DeleteMarker']
+
+    source = {'Bucket': bucket, 'Key': 'src', 'VersionId': marker['VersionId']}
+    e = assert_raises(ClientError, client.copy_object, Bucket=bucket, Key='dst', CopySource=source)
+    assert _get_status(e.response) == 400
+    e = assert_raises(ClientError, client.copy_object, Bucket=bucket, Key='dst', CopySource={'Bucket': bucket, 'Key': 'src'})
+    assert _get_status(e.response) == 404
+    response = client.list_object_versions(Bucket=bucket, Prefix='dst')
+    assert 'Versions' not in response
+
+@pytest.mark.versioning
 def test_versioning_multi_object_delete():
     bucket_name = get_new_bucket()
     client = get_client()
