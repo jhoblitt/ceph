@@ -16429,6 +16429,34 @@ def test_object_lock_multi_delete_bypass_denied():
     client.delete_object(Bucket=bucket_name, Key=key, VersionId=version_id, BypassGovernanceRetention=True)
 
 
+# TODO: remove fails_on_rgw when RGW stops letting a bucket ACL's WRITE grant
+# authorize s3:BypassGovernanceRetention on a delete:
+# https://github.com/jhoblitt/rgw-go/blob/main/docs/ceph-upstream-bugs.md#radosgw-lets-an-object-acls-write-grant-set-shorten-and-bypass-an-objects-retention-and-legal-hold
+@pytest.mark.fails_on_dbstore
+@pytest.mark.fails_on_rgw
+def test_object_lock_delete_bypass_by_bucket_write_grantee():
+    bucket_name = get_new_bucket_name()
+    client = get_client()
+    client.create_bucket(Bucket=bucket_name, ObjectLockEnabledForBucket=True)
+    client.put_bucket_acl(Bucket=bucket_name, ACL='public-read-write')
+    key = 'file1'
+    response = client.put_object(Bucket=bucket_name, Body='abc', Key=key)
+    version_id = response['VersionId']
+    retention = {'Mode':'GOVERNANCE', 'RetainUntilDate':datetime.datetime(2030,1,3,tzinfo=pytz.UTC)}
+    client.put_object_retention(Bucket=bucket_name, Key=key, Retention=retention)
+
+    unauthenticated_client = get_unauthenticated_client()
+    e = assert_raises(ClientError, unauthenticated_client.delete_object, Bucket=bucket_name, Key=key,
+                      VersionId=version_id, BypassGovernanceRetention=True)
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 403
+    assert error_code == 'AccessDenied'
+    response = client.get_object_retention(Bucket=bucket_name, Key=key, VersionId=version_id)
+    assert response['Retention'] == retention
+
+    client.delete_object(Bucket=bucket_name, Key=key, VersionId=version_id, BypassGovernanceRetention=True)
+
+
 @pytest.mark.fails_on_dbstore
 def test_object_lock_put_legal_hold():
     bucket_name = get_new_bucket_name()
