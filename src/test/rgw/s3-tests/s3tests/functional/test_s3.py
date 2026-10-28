@@ -9489,6 +9489,28 @@ def test_versioning_copy_object_source_delete_marker_version():
     assert 'Versions' not in response
 
 @pytest.mark.versioning
+@pytest.mark.fails_on_rgw
+def test_versioning_upload_part_copy_source_delete_marker_version():
+    # An UploadPartCopy whose source names a delete marker's version answers
+    # 400 Bad Request, as one may not copy a delete marker, and stores no
+    # part. RGW answers 404 NoSuchKey.
+    client = get_client()
+    bucket = get_new_bucket()
+    check_configure_versioning_retry(bucket, "Enabled", "Enabled")
+    client.put_object(Bucket=bucket, Key='src', Body='one')
+    marker = client.delete_object(Bucket=bucket, Key='src')
+    assert marker['DeleteMarker']
+    upload_id = client.create_multipart_upload(Bucket=bucket, Key='dst')['UploadId']
+
+    source = {'Bucket': bucket, 'Key': 'src', 'VersionId': marker['VersionId']}
+    e = assert_raises(ClientError, client.upload_part_copy, Bucket=bucket, Key='dst',
+                      UploadId=upload_id, PartNumber=1, CopySource=source)
+    assert _get_status(e.response) == 400
+    response = client.list_parts(Bucket=bucket, Key='dst', UploadId=upload_id)
+    assert 'Parts' not in response or response['Parts'] == []
+    client.abort_multipart_upload(Bucket=bucket, Key='dst', UploadId=upload_id)
+
+@pytest.mark.versioning
 def test_versioning_multi_object_delete():
     bucket_name = get_new_bucket()
     client = get_client()
