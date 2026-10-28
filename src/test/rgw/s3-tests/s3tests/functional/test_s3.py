@@ -9404,6 +9404,33 @@ def test_versioning_write_version_id_ignored():
     assert [(v['Key'], v['VersionId']) for v in response['Versions']] == [('put', 'null')]
 
 @pytest.mark.versioning
+@pytest.mark.fails_on_rgw
+def test_versioning_read_names_null_version():
+    # A GET or HEAD naming no version of a key whose current version is the
+    # null version names it in x-amz-version-id by its id, null: on a bucket
+    # whose versioning is suspended, and for an object written before the
+    # bucket's versioning was enabled. A bucket whose versioning was never
+    # enabled has no versions, and a read names none. RGW names no version
+    # for the null one.
+    client = get_client()
+    plain = get_new_bucket()
+    client.put_object(Bucket=plain, Key='k', Body='plain')
+    enabled = get_new_bucket()
+    client.put_object(Bucket=enabled, Key='k', Body='before')
+    check_configure_versioning_retry(enabled, "Enabled", "Enabled")
+    suspended = get_new_bucket()
+    check_configure_versioning_retry(suspended, "Enabled", "Enabled")
+    check_configure_versioning_retry(suspended, "Suspended", "Suspended")
+    client.put_object(Bucket=suspended, Key='k', Body='null')
+
+    for bucket, body, want in [(plain, 'plain', None), (enabled, 'before', 'null'), (suspended, 'null', 'null')]:
+        response = client.get_object(Bucket=bucket, Key='k')
+        assert _get_body(response) == body
+        assert response.get('VersionId') == want, bucket
+        response = client.head_object(Bucket=bucket, Key='k')
+        assert response.get('VersionId') == want, bucket
+
+@pytest.mark.versioning
 def test_versioning_multi_object_delete():
     bucket_name = get_new_bucket()
     client = get_client()
