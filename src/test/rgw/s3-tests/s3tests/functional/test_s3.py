@@ -8706,6 +8706,55 @@ def test_versioning_mfa_delete_object_version():
     assert 'Versions' not in response
     assert 'DeleteMarkers' not in response
 
+# TODO: remove fails_on_rgw when https://tracker.ceph.com/issues/78708 is resolved
+@pytest.mark.fails_on_rgw
+def test_versioning_mfa_delete_objects_version():
+    # On a bucket with MFA delete a DeleteObjects any of whose keys names a
+    # version needs the owner's verified code, one whose keys name none needs
+    # none, and one carrying a code that does not verify fails whatever its
+    # keys name. RGW's check is inverted: it lets the first through without a
+    # code and refuses the second.
+    serial, seed = get_main_mfa_device()
+    bucket_name = get_new_bucket()
+    client = get_client()
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+    version = client.put_object(Bucket=bucket_name, Key='a', Body='data')['VersionId']
+    client.put_object(Bucket=bucket_name, Key='b', Body='data')
+    mfa, step = _mfa_code_after(serial, seed)
+    client.put_bucket_versioning(Bucket=bucket_name, MFA=mfa,
+                                 VersioningConfiguration={'Status': 'Enabled', 'MFADelete': 'Enabled'})
+
+    # refused before its first key, with no document to name an error code
+    e = assert_raises(ClientError, client.delete_objects, Bucket=bucket_name,
+                      Delete={'Objects': [{'Key': 'a', 'VersionId': version}]})
+    assert e.response['ResponseMetadata']['HTTPStatusCode'] == 403
+    response = client.list_object_versions(Bucket=bucket_name)
+    assert version in [v['VersionId'] for v in response['Versions']]
+
+    response = client.delete_objects(Bucket=bucket_name, Delete={'Objects': [{'Key': 'b'}]})
+    assert 'Errors' not in response
+    assert response['Deleted'][0]['DeleteMarker'] is True
+
+    # "If you provide an invalid token, whether there are versioned keys in
+    # the request or not, the entire Multi-Object Delete request will fail."
+    code = _totp(seed, int(time.time()) // 30)
+    bad = '{} {}'.format(serial, str((int(code) + 1) % 10 ** 6).zfill(6))
+    e = assert_raises(ClientError, client.delete_objects, Bucket=bucket_name,
+                      Delete={'Objects': [{'Key': 'b'}]}, MFA=bad)
+    assert e.response['ResponseMetadata']['HTTPStatusCode'] == 403
+
+    response = client.list_object_versions(Bucket=bucket_name)
+    objects = [{'Key': v['Key'], 'VersionId': v['VersionId']}
+               for v in response['Versions'] + response['DeleteMarkers']]
+    assert len(objects) == 3
+    mfa, step = _mfa_code_after(serial, seed, step)
+    response = client.delete_objects(Bucket=bucket_name, Delete={'Objects': objects}, MFA=mfa)
+    assert 'Errors' not in response
+    assert len(response['Deleted']) == 3
+    response = client.list_object_versions(Bucket=bucket_name)
+    assert 'Versions' not in response
+    assert 'DeleteMarkers' not in response
+
 def check_obj_content(client, bucket_name, key, version_id, content):
     response = client.get_object(Bucket=bucket_name, Key=key, VersionId=version_id)
     if content is not None:
