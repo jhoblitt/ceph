@@ -8664,6 +8664,48 @@ def test_versioning_mfa_delete_code_used_once():
     assert error_code == 'AccessDenied'
     assert client.get_bucket_versioning(Bucket=bucket_name)['MFADelete'] == 'Enabled'
 
+def _mfa_code_after(serial, seed, after=None, step=30):
+    """An x-amz-mfa value of the device, serial and the code of a step later
+    than after, and that step, waiting for one with five seconds left in it so
+    that the request is checked in the step its code is for."""
+    while True:
+        now = time.time()
+        counter = int(now) // step
+        if (after is None or counter > after) and now % step <= step - 5:
+            return '{} {}'.format(serial, _totp(seed, counter)), counter
+        time.sleep(step - now % step + 1)
+
+def test_versioning_mfa_delete_object_version():
+    # On a bucket with MFA delete the delete of a version needs the owner's
+    # verified code, and a delete naming no version needs none.
+    serial, seed = get_main_mfa_device()
+    bucket_name = get_new_bucket()
+    client = get_client()
+    key = 'obj'
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+    version = client.put_object(Bucket=bucket_name, Key=key, Body='data')['VersionId']
+    mfa, step = _mfa_code_after(serial, seed)
+    client.put_bucket_versioning(Bucket=bucket_name, MFA=mfa,
+                                 VersioningConfiguration={'Status': 'Enabled', 'MFADelete': 'Enabled'})
+
+    e = assert_raises(ClientError, client.delete_object, Bucket=bucket_name, Key=key, VersionId=version)
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 403
+    assert error_code == 'AccessDenied'
+    marker = client.delete_object(Bucket=bucket_name, Key=key)
+    assert marker['DeleteMarker'] is True
+
+    # each code verifies once, so each delete waits for a step of its own
+    mfa, step = _mfa_code_after(serial, seed, step)
+    response = client.delete_object(Bucket=bucket_name, Key=key, VersionId=version, MFA=mfa)
+    assert response['VersionId'] == version
+    mfa, step = _mfa_code_after(serial, seed, step)
+    response = client.delete_object(Bucket=bucket_name, Key=key, VersionId=marker['VersionId'], MFA=mfa)
+    assert response['DeleteMarker'] is True
+    response = client.list_object_versions(Bucket=bucket_name)
+    assert 'Versions' not in response
+    assert 'DeleteMarkers' not in response
+
 def check_obj_content(client, bucket_name, key, version_id, content):
     response = client.get_object(Bucket=bucket_name, Key=key, VersionId=version_id)
     if content is not None:
