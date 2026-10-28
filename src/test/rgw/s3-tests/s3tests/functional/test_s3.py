@@ -16389,6 +16389,46 @@ def test_object_lock_multi_delete_object_with_retention():
 
 
 
+# TODO: remove fails_on_rgw when RGW's DeleteObjects checks
+# s3:BypassGovernanceRetention for each key on the key's ARN, as its
+# DeleteObject does:
+# https://github.com/jhoblitt/rgw-go/blob/main/docs/ceph-upstream-bugs.md#radosgws-deleteobjects-checks-s3bypassgovernanceretention-on-the-buckets-arn-not-each-keys
+@pytest.mark.fails_on_dbstore
+@pytest.mark.fails_on_rgw
+def test_object_lock_multi_delete_bypass_denied():
+    bucket_name = get_new_bucket_name()
+    client = get_client()
+    client.create_bucket(Bucket=bucket_name, ObjectLockEnabledForBucket=True)
+    key = 'file1'
+    response = client.put_object(Bucket=bucket_name, Body='abc', Key=key)
+    version_id = response['VersionId']
+    retention = {'Mode':'GOVERNANCE', 'RetainUntilDate':datetime.datetime(2030,1,3,tzinfo=pytz.UTC)}
+    client.put_object_retention(Bucket=bucket_name, Key=key, Retention=retention)
+    resource = _make_arn_resource("{}/*".format(bucket_name))
+    policy_document = make_json_policy("s3:BypassGovernanceRetention", resource, effect="Deny")
+    client.put_bucket_policy(Bucket=bucket_name, Policy=policy_document)
+
+    e = assert_raises(ClientError, client.delete_object, Bucket=bucket_name, Key=key,
+                      VersionId=version_id, BypassGovernanceRetention=True)
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 403
+    assert error_code == 'AccessDenied'
+
+    response = client.delete_objects(Bucket=bucket_name,
+                                     Delete={'Objects': [{'Key': key, 'VersionId': version_id}]},
+                                     BypassGovernanceRetention=True)
+    assert len(response.get('Deleted', [])) == 0
+    assert len(response['Errors']) == 1
+    assert response['Errors'][0]['Code'] == 'AccessDenied'
+    assert response['Errors'][0]['Key'] == key
+    assert response['Errors'][0]['VersionId'] == version_id
+    response = client.get_object_retention(Bucket=bucket_name, Key=key, VersionId=version_id)
+    assert response['Retention'] == retention
+
+    client.delete_bucket_policy(Bucket=bucket_name)
+    client.delete_object(Bucket=bucket_name, Key=key, VersionId=version_id, BypassGovernanceRetention=True)
+
+
 @pytest.mark.fails_on_dbstore
 def test_object_lock_put_legal_hold():
     bucket_name = get_new_bucket_name()
