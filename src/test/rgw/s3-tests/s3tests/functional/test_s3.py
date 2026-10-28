@@ -9431,6 +9431,42 @@ def test_versioning_read_names_null_version():
         assert response.get('VersionId') == want, bucket
 
 @pytest.mark.versioning
+@pytest.mark.fails_on_rgw
+def test_versioning_read_delete_marker_version():
+    # A GET or HEAD naming a delete marker's version answers 405
+    # MethodNotAllowed with x-amz-delete-marker: true and the marker's
+    # Last-Modified, and so does one naming versionId=null when the null
+    # version is a delete marker. A GetObjectAcl or GetObjectTagging naming
+    # one answers 405 with x-amz-delete-marker: true. RGW answers each 404
+    # NoSuchKey, as for a version that does not exist.
+    client = get_client()
+    enabled = get_new_bucket()
+    check_configure_versioning_retry(enabled, "Enabled", "Enabled")
+    client.put_object(Bucket=enabled, Key='k', Body='one')
+    marker = client.delete_object(Bucket=enabled, Key='k')
+    assert marker['DeleteMarker']
+    suspended = get_new_bucket()
+    check_configure_versioning_retry(suspended, "Enabled", "Enabled")
+    client.put_object(Bucket=suspended, Key='k', Body='one')
+    check_configure_versioning_retry(suspended, "Suspended", "Suspended")
+    client.delete_object(Bucket=suspended, Key='k')
+
+    reads = [
+        ('GET', client.get_object, True),
+        ('HEAD', client.head_object, True),
+        ('GetObjectAcl', client.get_object_acl, False),
+        ('GetObjectTagging', client.get_object_tagging, False),
+    ]
+    for bucket, version_id in [(enabled, marker['VersionId']), (suspended, 'null')]:
+        for name, read, last_modified in reads:
+            e = assert_raises(ClientError, read, Bucket=bucket, Key='k', VersionId=version_id)
+            assert _get_status(e.response) == 405, (name, version_id)
+            headers = e.response['ResponseMetadata']['HTTPHeaders']
+            assert headers.get('x-amz-delete-marker') == 'true', (name, version_id)
+            if last_modified:
+                assert 'last-modified' in headers, (name, version_id)
+
+@pytest.mark.versioning
 def test_versioning_multi_object_delete():
     bucket_name = get_new_bucket()
     client = get_client()
