@@ -11336,6 +11336,153 @@ def test_lifecycle_plain_null_version_current_transition():
     assert len(keys['STANDARD']) == 0
     assert len(keys[target_sc]) == 1
 
+def _transition_kept_fields(response):
+    return {f: response.get(f) for f in ('ETag', 'ContentLength', 'ContentType', 'Metadata', 'LastModified')}
+
+# The test harness for lifecycle is configured to treat days as 10 second intervals.
+@pytest.mark.lifecycle
+@pytest.mark.lifecycle_transition
+@pytest.mark.fails_on_aws
+def test_lifecycle_transition_keeps_object():
+    sc = configured_storage_classes()
+    if len(sc) < 2:
+        pytest.skip('requires 2 or more storage classes')
+    target_sc = sc[1]
+
+    bucket_name = get_new_bucket()
+    client = get_client()
+    metadata = {'origin': 'transition'}
+    single = 'keep/single'
+    single_body = 'single-part body'
+    client.put_object(Bucket=bucket_name, Key=single, Body=single_body, ContentType='text/plain', Metadata=metadata)
+    multi = 'keep/multi'
+    (upload_id, multi_body, parts) = _multipart_upload(bucket_name=bucket_name, key=multi, size=6*1024*1024,
+                                                        content_type='application/octet-stream', metadata=metadata)
+    client.complete_multipart_upload(Bucket=bucket_name, Key=multi, UploadId=upload_id, MultipartUpload={'Parts': parts})
+    bodies = {single: single_body, multi: multi_body}
+    before = {key: _transition_kept_fields(client.head_object(Bucket=bucket_name, Key=key)) for key in bodies}
+
+    client.put_bucket_lifecycle_configuration(Bucket=bucket_name, LifecycleConfiguration={'Rules': [
+        {'ID': 'rule1', 'Filter': {'Prefix': 'keep/'}, 'Status': 'Enabled', 'Transitions': [{'Days': 1, 'StorageClass': target_sc}]},
+    ]})
+
+    lc_interval = get_lc_debug_interval()
+    time.sleep(4*lc_interval)
+
+    keys = list_bucket_storage_class(client, bucket_name)
+    assert len(keys[target_sc]) == 2
+    for key, body in bodies.items():
+        response = client.head_object(Bucket=bucket_name, Key=key)
+        assert response['StorageClass'] == target_sc
+        assert _transition_kept_fields(response) == before[key]
+        response = client.get_object(Bucket=bucket_name, Key=key)
+        assert _get_body(response) == body
+
+# The test harness for lifecycle is configured to treat days as 10 second intervals.
+@pytest.mark.lifecycle
+@pytest.mark.lifecycle_transition
+@pytest.mark.fails_on_aws
+@pytest.mark.fails_on_dbstore
+def test_lifecycle_transition_keeps_object_lock():
+    sc = configured_storage_classes()
+    if len(sc) < 2:
+        pytest.skip('requires 2 or more storage classes')
+    target_sc = sc[1]
+
+    bucket_name = get_new_bucket_name()
+    client = get_client()
+    client.create_bucket(Bucket=bucket_name, ObjectLockEnabledForBucket=True)
+    key = 'locked'
+    body = 'retained body'
+    version_id = client.put_object(Bucket=bucket_name, Key=key, Body=body)['VersionId']
+    retention = {'Mode': 'GOVERNANCE', 'RetainUntilDate': datetime.datetime(2030, 1, 1, tzinfo=pytz.UTC)}
+    client.put_object_retention(Bucket=bucket_name, Key=key, Retention=retention)
+    client.put_object_legal_hold(Bucket=bucket_name, Key=key, LegalHold={'Status': 'ON'})
+
+    client.put_bucket_lifecycle_configuration(Bucket=bucket_name, LifecycleConfiguration={'Rules': [
+        {'ID': 'rule1', 'Filter': {'Prefix': ''}, 'Status': 'Enabled', 'Transitions': [{'Days': 1, 'StorageClass': target_sc}]},
+    ]})
+
+    lc_interval = get_lc_debug_interval()
+    time.sleep(4*lc_interval)
+
+    keys = list_bucket_storage_class(client, bucket_name)
+    assert [k['VersionId'] for k in keys[target_sc]] == [version_id]
+    assert client.get_object_retention(Bucket=bucket_name, Key=key, VersionId=version_id)['Retention'] == retention
+    assert client.get_object_legal_hold(Bucket=bucket_name, Key=key, VersionId=version_id)['LegalHold']['Status'] == 'ON'
+    assert _get_body(client.get_object(Bucket=bucket_name, Key=key, VersionId=version_id)) == body
+
+    client.put_object_legal_hold(Bucket=bucket_name, Key=key, VersionId=version_id, LegalHold={'Status': 'OFF'})
+    client.delete_object(Bucket=bucket_name, Key=key, VersionId=version_id, BypassGovernanceRetention=True)
+
+# The test harness for lifecycle is configured to treat days as 10 second intervals.
+@pytest.mark.lifecycle
+@pytest.mark.lifecycle_transition
+@pytest.mark.fails_on_aws
+@pytest.mark.fails_on_rgw
+def test_lifecycle_transition_current_after_noncurrent_removal():
+    sc = configured_storage_classes()
+    if len(sc) < 2:
+        pytest.skip('requires 2 or more storage classes')
+    target_sc = sc[1]
+
+    bucket_name = get_new_bucket()
+    client = get_client()
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+    key = 'current'
+    old_id = client.put_object(Bucket=bucket_name, Key=key, Body='old body')['VersionId']
+    current_id = client.put_object(Bucket=bucket_name, Key=key, Body='current body')['VersionId']
+    client.delete_object(Bucket=bucket_name, Key=key, VersionId=old_id)
+
+    client.put_bucket_lifecycle_configuration(Bucket=bucket_name, LifecycleConfiguration={'Rules': [
+        {'ID': 'rule1', 'Filter': {'Prefix': ''}, 'Status': 'Enabled', 'Transitions': [{'Days': 1, 'StorageClass': target_sc}]},
+    ]})
+
+    lc_interval = get_lc_debug_interval()
+    time.sleep(4*lc_interval)
+
+    versions = client.list_object_versions(Bucket=bucket_name)['Versions']
+    assert [(v['VersionId'], v['StorageClass'], v['IsLatest']) for v in versions] == [(current_id, target_sc, True)]
+    assert [o['Key'] for o in client.list_objects(Bucket=bucket_name).get('Contents', [])] == [key]
+    assert _get_body(client.get_object(Bucket=bucket_name, Key=key)) == 'current body'
+
+# The test harness for lifecycle is configured to treat days as 10 second intervals.
+@pytest.mark.lifecycle
+@pytest.mark.lifecycle_transition
+@pytest.mark.fails_on_aws
+@pytest.mark.fails_on_dbstore
+@pytest.mark.fails_on_rgw
+def test_lifecycle_transition_adds_no_default_retention():
+    sc = configured_storage_classes()
+    if len(sc) < 2:
+        pytest.skip('requires 2 or more storage classes')
+    target_sc = sc[1]
+
+    bucket_name = get_new_bucket_name()
+    client = get_client()
+    client.create_bucket(Bucket=bucket_name, ObjectLockEnabledForBucket=True)
+    key = 'unlocked'
+    body = 'unlocked body'
+    version_id = client.put_object(Bucket=bucket_name, Key=key, Body=body)['VersionId']
+    client.put_object_lock_configuration(Bucket=bucket_name, ObjectLockConfiguration={
+        'ObjectLockEnabled': 'Enabled', 'Rule': {'DefaultRetention': {'Mode': 'GOVERNANCE', 'Days': 1}}})
+
+    client.put_bucket_lifecycle_configuration(Bucket=bucket_name, LifecycleConfiguration={'Rules': [
+        {'ID': 'rule1', 'Filter': {'Prefix': ''}, 'Status': 'Enabled', 'Transitions': [{'Days': 1, 'StorageClass': target_sc}]},
+    ]})
+
+    lc_interval = get_lc_debug_interval()
+    time.sleep(4*lc_interval)
+
+    keys = list_bucket_storage_class(client, bucket_name)
+    assert [k['VersionId'] for k in keys[target_sc]] == [version_id]
+    assert _get_body(client.get_object(Bucket=bucket_name, Key=key, VersionId=version_id)) == body
+    e = assert_raises(ClientError, client.get_object_retention, Bucket=bucket_name, Key=key, VersionId=version_id)
+    status, _ = _get_status_and_error_code(e.response)
+    assert status == 404
+
+    client.delete_object(Bucket=bucket_name, Key=key, VersionId=version_id)
+
 def verify_object(client, bucket, key, content=None, sc=None):
     response = client.get_object(Bucket=bucket, Key=key)
 
