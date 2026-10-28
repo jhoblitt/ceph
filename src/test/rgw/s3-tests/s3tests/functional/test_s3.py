@@ -8852,6 +8852,37 @@ def test_versioning_obj_plain_null_version_removal():
     response = client.list_object_versions(Bucket=bucket_name)
     assert not 'Versions' in response
 
+@pytest.mark.fails_on_aws # not run on AWS, marked as the conditional delete tests are
+@pytest.mark.conditional_write
+@pytest.mark.fails_on_dbstore
+@pytest.mark.versioning
+@pytest.mark.fails_on_rgw
+def test_versioning_obj_plain_null_version_removal_if_match():
+    # The object written before versioning was enabled is the null version,
+    # and a delete of versionId=null checks If-Match against its ETag. RGW
+    # checks the entry of the key's version marker, which holds no ETag, so
+    # it refuses both deletes.
+    bucket_name = get_new_bucket()
+    check_versioning(bucket_name, None)
+
+    client = get_client()
+    key = 'testobjfoo'
+    etag = client.put_object(Bucket=bucket_name, Key=key, Body='fooz')['ETag']
+
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+    client.put_object(Bucket=bucket_name, Key=key, Body='zzz')
+
+    e = assert_raises(ClientError, client.delete_object, Bucket=bucket_name, Key=key, VersionId='null', IfMatch='badetag')
+    assert (412, 'PreconditionFailed') == _get_status_and_error_code(e.response)
+    response = client.list_object_versions(Bucket=bucket_name)
+    assert 'null' in [v['VersionId'] for v in response['Versions']]
+
+    response = client.delete_object(Bucket=bucket_name, Key=key, VersionId='null', IfMatch=etag)
+    assert response['VersionId'] == 'null'
+    assert 'DeleteMarker' not in response
+    response = client.list_object_versions(Bucket=bucket_name)
+    assert 'null' not in [v['VersionId'] for v in response['Versions']]
+
 @pytest.mark.versioning
 def test_versioning_obj_plain_null_version_overwrite():
     bucket_name = get_new_bucket()
