@@ -22627,6 +22627,32 @@ def test_delete_marker_versioned_get():
     assert e.response['ResponseMetadata']['HTTPHeaders'].get('x-amz-delete-marker') == 'true'
 
 @pytest.mark.delete_marker
+@pytest.mark.fails_on_dbstore
+@pytest.mark.versioning
+@pytest.mark.fails_on_rgw
+def test_delete_marker_suspended_null_removal_reports_marker():
+    # On a bucket whose versioning is suspended a delete naming no version
+    # writes the null delete marker, and the delete of versionId=null that
+    # removes it says it removed a delete marker. RGW reads the entry of the
+    # key's version marker, which is no delete marker, and sends no
+    # x-amz-delete-marker.
+    bucket = get_new_bucket()
+    client = get_client()
+    key = "ringo.txt"
+    check_configure_versioning_retry(bucket, "Enabled", "Enabled")
+    client.put_object(Bucket=bucket, Key=key, Body="body version %s" % (key))
+    check_configure_versioning_retry(bucket, "Suspended", "Suspended")
+    response = client.delete_object(Bucket=bucket, Key=key)
+    assert response['DeleteMarker'] is True
+    assert response['VersionId'] == 'null'
+
+    response = client.delete_object(Bucket=bucket, Key=key, VersionId='null')
+    assert response.get('DeleteMarker') is True
+    assert response['VersionId'] == 'null'
+    response = client.list_object_versions(Bucket=bucket)
+    assert 'DeleteMarkers' not in response
+
+@pytest.mark.delete_marker
 @pytest.mark.lifecycle
 @pytest.mark.lifecycle_expiration
 @pytest.mark.fails_on_dbstore
