@@ -8883,6 +8883,44 @@ def test_versioning_obj_plain_null_version_removal_if_match():
     response = client.list_object_versions(Bucket=bucket_name)
     assert 'null' not in [v['VersionId'] for v in response['Versions']]
 
+@pytest.mark.fails_on_aws # only supported for directory buckets
+@pytest.mark.conditional_write
+@pytest.mark.fails_on_dbstore
+@pytest.mark.versioning
+@pytest.mark.fails_on_rgw
+def test_versioning_obj_plain_null_version_removal_if_match_size_and_mtime():
+    # The object written before versioning was enabled is the null version,
+    # and a delete of versionId=null checks x-amz-if-match-size and
+    # x-amz-if-match-last-modified-time against its size and mtime. RGW
+    # checks the entry of the key's version marker, whose size and mtime are
+    # zero, so it refuses the delete whose conditions the null version meets.
+    bucket_name = get_new_bucket()
+    check_versioning(bucket_name, None)
+
+    client = get_client()
+    key = 'testobjfoo'
+    client.put_object(Bucket=bucket_name, Key=key, Body='fooz')
+
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+    client.put_object(Bucket=bucket_name, Key=key, Body='zzz')
+
+    response = client.list_object_versions(Bucket=bucket_name)
+    null = [v for v in response['Versions'] if v['VersionId'] == 'null'][0]
+
+    e = assert_raises(ClientError, client.delete_object, Bucket=bucket_name, Key=key, VersionId='null',
+                      IfMatchSize=null['Size'] + 1)
+    assert (412, 'PreconditionFailed') == _get_status_and_error_code(e.response)
+    e = assert_raises(ClientError, client.delete_object, Bucket=bucket_name, Key=key, VersionId='null',
+                      IfMatchLastModifiedTime=datetime.datetime(2015, 1, 1))
+    assert (412, 'PreconditionFailed') == _get_status_and_error_code(e.response)
+    response = client.list_object_versions(Bucket=bucket_name)
+    assert 'null' in [v['VersionId'] for v in response['Versions']]
+
+    client.delete_object(Bucket=bucket_name, Key=key, VersionId='null',
+                         IfMatchSize=null['Size'], IfMatchLastModifiedTime=null['LastModified'])
+    response = client.list_object_versions(Bucket=bucket_name)
+    assert 'null' not in [v['VersionId'] for v in response['Versions']]
+
 @pytest.mark.versioning
 def test_versioning_obj_plain_null_version_overwrite():
     bucket_name = get_new_bucket()
