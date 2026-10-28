@@ -18114,6 +18114,21 @@ def test_object_checksum_crc64nvme():
     assert error_code == 'BadDigest'
 
 @pytest.mark.checksum
+def test_object_checksum_type_full_object():
+    # A PutObject's checksum is of the whole object, so its type is
+    # FULL_OBJECT whatever the algorithm.
+    bucket = get_new_bucket()
+    client = get_client()
+
+    key = "myobj"
+    size = 1024
+    body = FakeWriteFile(size, 'A')
+    sha256sum = 'arcu6553sHVAiX4MjW0j7I7vD4w6R+Gz9Ok0Q9lTa+0='
+    response = client.put_object(Bucket=bucket, Key=key, Body=body, ChecksumAlgorithm='SHA256', ChecksumSHA256=sha256sum)
+    assert response['ChecksumType'] == 'FULL_OBJECT'
+    assert response['ChecksumSHA256'] == sha256sum
+
+@pytest.mark.checksum
 @pytest.mark.fails_on_dbstore
 def test_multipart_checksum_sha256():
     bucket = get_new_bucket()
