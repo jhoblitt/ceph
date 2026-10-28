@@ -8664,6 +8664,97 @@ def test_versioning_mfa_delete_code_used_once():
     assert error_code == 'AccessDenied'
     assert client.get_bucket_versioning(Bucket=bucket_name)['MFADelete'] == 'Enabled'
 
+def _mfa_code_after(serial, seed, after=None, step=30):
+    """An x-amz-mfa value of the device, serial and the code of a step later
+    than after, and that step, waiting for one with five seconds left in it so
+    that the request is checked in the step its code is for."""
+    while True:
+        now = time.time()
+        counter = int(now) // step
+        if (after is None or counter > after) and now % step <= step - 5:
+            return '{} {}'.format(serial, _totp(seed, counter)), counter
+        time.sleep(step - now % step + 1)
+
+def test_versioning_mfa_delete_object_version():
+    # On a bucket with MFA delete the delete of a version needs the owner's
+    # verified code, and a delete naming no version needs none.
+    serial, seed = get_main_mfa_device()
+    bucket_name = get_new_bucket()
+    client = get_client()
+    key = 'obj'
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+    version = client.put_object(Bucket=bucket_name, Key=key, Body='data')['VersionId']
+    mfa, step = _mfa_code_after(serial, seed)
+    client.put_bucket_versioning(Bucket=bucket_name, MFA=mfa,
+                                 VersioningConfiguration={'Status': 'Enabled', 'MFADelete': 'Enabled'})
+
+    e = assert_raises(ClientError, client.delete_object, Bucket=bucket_name, Key=key, VersionId=version)
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 403
+    assert error_code == 'AccessDenied'
+    marker = client.delete_object(Bucket=bucket_name, Key=key)
+    assert marker['DeleteMarker'] is True
+
+    # each code verifies once, so each delete waits for a step of its own
+    mfa, step = _mfa_code_after(serial, seed, step)
+    response = client.delete_object(Bucket=bucket_name, Key=key, VersionId=version, MFA=mfa)
+    assert response['VersionId'] == version
+    mfa, step = _mfa_code_after(serial, seed, step)
+    response = client.delete_object(Bucket=bucket_name, Key=key, VersionId=marker['VersionId'], MFA=mfa)
+    assert response['DeleteMarker'] is True
+    response = client.list_object_versions(Bucket=bucket_name)
+    assert 'Versions' not in response
+    assert 'DeleteMarkers' not in response
+
+# TODO: remove fails_on_rgw when https://tracker.ceph.com/issues/78708 is resolved
+@pytest.mark.fails_on_rgw
+def test_versioning_mfa_delete_objects_version():
+    # On a bucket with MFA delete a DeleteObjects any of whose keys names a
+    # version needs the owner's verified code, one whose keys name none needs
+    # none, and one carrying a code that does not verify fails whatever its
+    # keys name. RGW's check is inverted: it lets the first through without a
+    # code and refuses the second.
+    serial, seed = get_main_mfa_device()
+    bucket_name = get_new_bucket()
+    client = get_client()
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+    version = client.put_object(Bucket=bucket_name, Key='a', Body='data')['VersionId']
+    client.put_object(Bucket=bucket_name, Key='b', Body='data')
+    mfa, step = _mfa_code_after(serial, seed)
+    client.put_bucket_versioning(Bucket=bucket_name, MFA=mfa,
+                                 VersioningConfiguration={'Status': 'Enabled', 'MFADelete': 'Enabled'})
+
+    # refused before its first key, with no document to name an error code
+    e = assert_raises(ClientError, client.delete_objects, Bucket=bucket_name,
+                      Delete={'Objects': [{'Key': 'a', 'VersionId': version}]})
+    assert e.response['ResponseMetadata']['HTTPStatusCode'] == 403
+    response = client.list_object_versions(Bucket=bucket_name)
+    assert version in [v['VersionId'] for v in response['Versions']]
+
+    response = client.delete_objects(Bucket=bucket_name, Delete={'Objects': [{'Key': 'b'}]})
+    assert 'Errors' not in response
+    assert response['Deleted'][0]['DeleteMarker'] is True
+
+    # "If you provide an invalid token, whether there are versioned keys in
+    # the request or not, the entire Multi-Object Delete request will fail."
+    code = _totp(seed, int(time.time()) // 30)
+    bad = '{} {}'.format(serial, str((int(code) + 1) % 10 ** 6).zfill(6))
+    e = assert_raises(ClientError, client.delete_objects, Bucket=bucket_name,
+                      Delete={'Objects': [{'Key': 'b'}]}, MFA=bad)
+    assert e.response['ResponseMetadata']['HTTPStatusCode'] == 403
+
+    response = client.list_object_versions(Bucket=bucket_name)
+    objects = [{'Key': v['Key'], 'VersionId': v['VersionId']}
+               for v in response['Versions'] + response['DeleteMarkers']]
+    assert len(objects) == 3
+    mfa, step = _mfa_code_after(serial, seed, step)
+    response = client.delete_objects(Bucket=bucket_name, Delete={'Objects': objects}, MFA=mfa)
+    assert 'Errors' not in response
+    assert len(response['Deleted']) == 3
+    response = client.list_object_versions(Bucket=bucket_name)
+    assert 'Versions' not in response
+    assert 'DeleteMarkers' not in response
+
 def check_obj_content(client, bucket_name, key, version_id, content):
     response = client.get_object(Bucket=bucket_name, Key=key, VersionId=version_id)
     if content is not None:
@@ -8851,6 +8942,75 @@ def test_versioning_obj_plain_null_version_removal():
 
     response = client.list_object_versions(Bucket=bucket_name)
     assert not 'Versions' in response
+
+@pytest.mark.fails_on_aws # not run on AWS, marked as the conditional delete tests are
+@pytest.mark.conditional_write
+@pytest.mark.fails_on_dbstore
+@pytest.mark.versioning
+@pytest.mark.fails_on_rgw
+def test_versioning_obj_plain_null_version_removal_if_match():
+    # The object written before versioning was enabled is the null version,
+    # and a delete of versionId=null checks If-Match against its ETag. RGW
+    # checks the entry of the key's version marker, which holds no ETag, so
+    # it refuses both deletes.
+    bucket_name = get_new_bucket()
+    check_versioning(bucket_name, None)
+
+    client = get_client()
+    key = 'testobjfoo'
+    etag = client.put_object(Bucket=bucket_name, Key=key, Body='fooz')['ETag']
+
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+    client.put_object(Bucket=bucket_name, Key=key, Body='zzz')
+
+    e = assert_raises(ClientError, client.delete_object, Bucket=bucket_name, Key=key, VersionId='null', IfMatch='badetag')
+    assert (412, 'PreconditionFailed') == _get_status_and_error_code(e.response)
+    response = client.list_object_versions(Bucket=bucket_name)
+    assert 'null' in [v['VersionId'] for v in response['Versions']]
+
+    response = client.delete_object(Bucket=bucket_name, Key=key, VersionId='null', IfMatch=etag)
+    assert response['VersionId'] == 'null'
+    assert 'DeleteMarker' not in response
+    response = client.list_object_versions(Bucket=bucket_name)
+    assert 'null' not in [v['VersionId'] for v in response['Versions']]
+
+@pytest.mark.fails_on_aws # only supported for directory buckets
+@pytest.mark.conditional_write
+@pytest.mark.fails_on_dbstore
+@pytest.mark.versioning
+@pytest.mark.fails_on_rgw
+def test_versioning_obj_plain_null_version_removal_if_match_size_and_mtime():
+    # The object written before versioning was enabled is the null version,
+    # and a delete of versionId=null checks x-amz-if-match-size and
+    # x-amz-if-match-last-modified-time against its size and mtime. RGW
+    # checks the entry of the key's version marker, whose size and mtime are
+    # zero, so it refuses the delete whose conditions the null version meets.
+    bucket_name = get_new_bucket()
+    check_versioning(bucket_name, None)
+
+    client = get_client()
+    key = 'testobjfoo'
+    client.put_object(Bucket=bucket_name, Key=key, Body='fooz')
+
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+    client.put_object(Bucket=bucket_name, Key=key, Body='zzz')
+
+    response = client.list_object_versions(Bucket=bucket_name)
+    null = [v for v in response['Versions'] if v['VersionId'] == 'null'][0]
+
+    e = assert_raises(ClientError, client.delete_object, Bucket=bucket_name, Key=key, VersionId='null',
+                      IfMatchSize=null['Size'] + 1)
+    assert (412, 'PreconditionFailed') == _get_status_and_error_code(e.response)
+    e = assert_raises(ClientError, client.delete_object, Bucket=bucket_name, Key=key, VersionId='null',
+                      IfMatchLastModifiedTime=datetime.datetime(2015, 1, 1))
+    assert (412, 'PreconditionFailed') == _get_status_and_error_code(e.response)
+    response = client.list_object_versions(Bucket=bucket_name)
+    assert 'null' in [v['VersionId'] for v in response['Versions']]
+
+    client.delete_object(Bucket=bucket_name, Key=key, VersionId='null',
+                         IfMatchSize=null['Size'], IfMatchLastModifiedTime=null['LastModified'])
+    response = client.list_object_versions(Bucket=bucket_name)
+    assert 'null' not in [v['VersionId'] for v in response['Versions']]
 
 @pytest.mark.versioning
 def test_versioning_obj_plain_null_version_overwrite():
@@ -22558,6 +22718,32 @@ def test_delete_marker_versioned_get():
     assert e.response['ResponseMetadata']['HTTPHeaders'].get('x-amz-delete-marker') == 'true'
 
 @pytest.mark.delete_marker
+@pytest.mark.fails_on_dbstore
+@pytest.mark.versioning
+@pytest.mark.fails_on_rgw
+def test_delete_marker_suspended_null_removal_reports_marker():
+    # On a bucket whose versioning is suspended a delete naming no version
+    # writes the null delete marker, and the delete of versionId=null that
+    # removes it says it removed a delete marker. RGW reads the entry of the
+    # key's version marker, which is no delete marker, and sends no
+    # x-amz-delete-marker.
+    bucket = get_new_bucket()
+    client = get_client()
+    key = "ringo.txt"
+    check_configure_versioning_retry(bucket, "Enabled", "Enabled")
+    client.put_object(Bucket=bucket, Key=key, Body="body version %s" % (key))
+    check_configure_versioning_retry(bucket, "Suspended", "Suspended")
+    response = client.delete_object(Bucket=bucket, Key=key)
+    assert response['DeleteMarker'] is True
+    assert response['VersionId'] == 'null'
+
+    response = client.delete_object(Bucket=bucket, Key=key, VersionId='null')
+    assert response.get('DeleteMarker') is True
+    assert response['VersionId'] == 'null'
+    response = client.list_object_versions(Bucket=bucket)
+    assert 'DeleteMarkers' not in response
+
+@pytest.mark.delete_marker
 @pytest.mark.lifecycle
 @pytest.mark.lifecycle_expiration
 @pytest.mark.fails_on_dbstore
@@ -23000,6 +23186,49 @@ def test_delete_object_current_if_match():
     # remove delete marker to retest IfMatch='*'
     client.delete_object(Bucket=bucket, Key=key, VersionId=version)
     client.delete_object(Bucket=bucket, Key=key, IfMatch='*')
+
+@pytest.mark.fails_on_aws # not run on AWS, marked as the conditional delete tests are
+@pytest.mark.conditional_write
+@pytest.mark.fails_on_dbstore
+@pytest.mark.versioning
+@pytest.mark.fails_on_rgw
+def test_delete_object_current_if_match_concurrent():
+    # Concurrent deletes naming no version, each under If-Match of the
+    # current version's ETag, on a bucket whose versioning is enabled: at
+    # most one writes a delete marker, every other one fails its precondition
+    # or conflicts with a concurrent write, and the key's delete markers are
+    # those of the deletes that succeeded. RGW checks the condition before it
+    # links the marker and links it unchecked, so several deletes can
+    # succeed.
+    client = get_client()
+    bucket = get_new_bucket(client)
+    check_configure_versioning_retry(bucket, "Enabled", "Enabled")
+    key = 'obj'
+    etag = client.put_object(Bucket=bucket, Key=key, Body='data')['ETag']
+    deleted = []
+    refused = []
+    # every delete checks its condition before any links its marker
+    barrier = threading.Barrier(8)
+    def delete():
+        barrier.wait()
+        try:
+            response = client.delete_object(Bucket=bucket, Key=key, IfMatch=etag)
+            deleted.append(response['VersionId'])
+        except ClientError as e:
+            refused.append(_get_status_and_error_code(e.response))
+    threads = [threading.Thread(target=delete) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(deleted) <= 1, deleted
+    assert len(refused) == 8 - len(deleted), refused
+    refusals = {(412, 'PreconditionFailed'), (409, 'ConditionalRequestConflict')}
+    assert set(refused) <= refusals, refused
+    response = client.list_object_versions(Bucket=bucket)
+    assert sorted(m['VersionId'] for m in response.get('DeleteMarkers', [])) == sorted(deleted)
+    assert len(response['Versions']) == 1
 
 @pytest.mark.fails_on_aws # only supported for directory buckets
 @pytest.mark.conditional_write
