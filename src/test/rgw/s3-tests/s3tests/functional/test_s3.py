@@ -22350,6 +22350,23 @@ def test_delete_marker_suspended():
     check_delete_marker(client, bucket, key, 'true')
 
 @pytest.mark.delete_marker
+@pytest.mark.fails_on_dbstore
+@pytest.mark.versioning
+def test_delete_marker_versioned_get():
+    # A GET of a key whose current version is a delete marker answers 404
+    # NoSuchKey with x-amz-delete-marker: true, as a HEAD does.
+    bucket = get_new_bucket()
+    client = get_client()
+    key = "merry.txt"
+    check_configure_versioning_retry(bucket, "Enabled", "Enabled")
+    client.put_object(Bucket=bucket, Key=key, Body="body version %s" % (key))
+    client.delete_object(Bucket=bucket, Key=key)
+    e = assert_raises(ClientError, client.get_object, Bucket=bucket, Key=key)
+    status, error_code = _get_status_and_error_code(e.response)
+    assert (status, error_code) == (404, 'NoSuchKey')
+    assert e.response['ResponseMetadata']['HTTPHeaders'].get('x-amz-delete-marker') == 'true'
+
+@pytest.mark.delete_marker
 @pytest.mark.lifecycle
 @pytest.mark.lifecycle_expiration
 @pytest.mark.fails_on_dbstore
