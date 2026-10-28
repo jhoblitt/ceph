@@ -23096,6 +23096,49 @@ def test_delete_object_current_if_match():
     client.delete_object(Bucket=bucket, Key=key, VersionId=version)
     client.delete_object(Bucket=bucket, Key=key, IfMatch='*')
 
+@pytest.mark.fails_on_aws # not run on AWS, marked as the conditional delete tests are
+@pytest.mark.conditional_write
+@pytest.mark.fails_on_dbstore
+@pytest.mark.versioning
+@pytest.mark.fails_on_rgw
+def test_delete_object_current_if_match_concurrent():
+    # Concurrent deletes naming no version, each under If-Match of the
+    # current version's ETag, on a bucket whose versioning is enabled: at
+    # most one writes a delete marker, every other one fails its precondition
+    # or conflicts with a concurrent write, and the key's delete markers are
+    # those of the deletes that succeeded. RGW checks the condition before it
+    # links the marker and links it unchecked, so several deletes can
+    # succeed.
+    client = get_client()
+    bucket = get_new_bucket(client)
+    check_configure_versioning_retry(bucket, "Enabled", "Enabled")
+    key = 'obj'
+    etag = client.put_object(Bucket=bucket, Key=key, Body='data')['ETag']
+    deleted = []
+    refused = []
+    # every delete checks its condition before any links its marker
+    barrier = threading.Barrier(8)
+    def delete():
+        barrier.wait()
+        try:
+            response = client.delete_object(Bucket=bucket, Key=key, IfMatch=etag)
+            deleted.append(response['VersionId'])
+        except ClientError as e:
+            refused.append(_get_status_and_error_code(e.response))
+    threads = [threading.Thread(target=delete) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(deleted) <= 1, deleted
+    assert len(refused) == 8 - len(deleted), refused
+    refusals = {(412, 'PreconditionFailed'), (409, 'ConditionalRequestConflict')}
+    assert set(refused) <= refusals, refused
+    response = client.list_object_versions(Bucket=bucket)
+    assert sorted(m['VersionId'] for m in response.get('DeleteMarkers', [])) == sorted(deleted)
+    assert len(response['Versions']) == 1
+
 @pytest.mark.fails_on_aws # only supported for directory buckets
 @pytest.mark.conditional_write
 @pytest.mark.fails_on_dbstore
