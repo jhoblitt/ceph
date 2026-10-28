@@ -9404,6 +9404,113 @@ def test_versioning_write_version_id_ignored():
     assert [(v['Key'], v['VersionId']) for v in response['Versions']] == [('put', 'null')]
 
 @pytest.mark.versioning
+@pytest.mark.fails_on_rgw
+def test_versioning_read_names_null_version():
+    # A GET or HEAD naming no version of a key whose current version is the
+    # null version names it in x-amz-version-id by its id, null: on a bucket
+    # whose versioning is suspended, and for an object written before the
+    # bucket's versioning was enabled. A bucket whose versioning was never
+    # enabled has no versions, and a read names none. RGW names no version
+    # for the null one.
+    client = get_client()
+    plain = get_new_bucket()
+    client.put_object(Bucket=plain, Key='k', Body='plain')
+    enabled = get_new_bucket()
+    client.put_object(Bucket=enabled, Key='k', Body='before')
+    check_configure_versioning_retry(enabled, "Enabled", "Enabled")
+    suspended = get_new_bucket()
+    check_configure_versioning_retry(suspended, "Enabled", "Enabled")
+    check_configure_versioning_retry(suspended, "Suspended", "Suspended")
+    client.put_object(Bucket=suspended, Key='k', Body='null')
+
+    for bucket, body, want in [(plain, 'plain', None), (enabled, 'before', 'null'), (suspended, 'null', 'null')]:
+        response = client.get_object(Bucket=bucket, Key='k')
+        assert _get_body(response) == body
+        assert response.get('VersionId') == want, bucket
+        response = client.head_object(Bucket=bucket, Key='k')
+        assert response.get('VersionId') == want, bucket
+
+@pytest.mark.versioning
+@pytest.mark.fails_on_rgw
+def test_versioning_read_delete_marker_version():
+    # A GET or HEAD naming a delete marker's version answers 405
+    # MethodNotAllowed with x-amz-delete-marker: true and the marker's
+    # Last-Modified, and so does one naming versionId=null when the null
+    # version is a delete marker. A GetObjectAcl or GetObjectTagging naming
+    # one answers 405 with x-amz-delete-marker: true. RGW answers each 404
+    # NoSuchKey, as for a version that does not exist.
+    client = get_client()
+    enabled = get_new_bucket()
+    check_configure_versioning_retry(enabled, "Enabled", "Enabled")
+    client.put_object(Bucket=enabled, Key='k', Body='one')
+    marker = client.delete_object(Bucket=enabled, Key='k')
+    assert marker['DeleteMarker']
+    suspended = get_new_bucket()
+    check_configure_versioning_retry(suspended, "Enabled", "Enabled")
+    client.put_object(Bucket=suspended, Key='k', Body='one')
+    check_configure_versioning_retry(suspended, "Suspended", "Suspended")
+    client.delete_object(Bucket=suspended, Key='k')
+
+    reads = [
+        ('GET', client.get_object, True),
+        ('HEAD', client.head_object, True),
+        ('GetObjectAcl', client.get_object_acl, False),
+        ('GetObjectTagging', client.get_object_tagging, False),
+    ]
+    for bucket, version_id in [(enabled, marker['VersionId']), (suspended, 'null')]:
+        for name, read, last_modified in reads:
+            e = assert_raises(ClientError, read, Bucket=bucket, Key='k', VersionId=version_id)
+            assert _get_status(e.response) == 405, (name, version_id)
+            headers = e.response['ResponseMetadata']['HTTPHeaders']
+            assert headers.get('x-amz-delete-marker') == 'true', (name, version_id)
+            if last_modified:
+                assert 'last-modified' in headers, (name, version_id)
+
+@pytest.mark.versioning
+@pytest.mark.fails_on_rgw
+def test_versioning_copy_object_source_delete_marker_version():
+    # A CopyObject whose source names a delete marker's version answers 400
+    # Bad Request, as one may not copy a delete marker, and writes nothing.
+    # A source whose current version is a delete marker, named by no
+    # version, answers 404. RGW answers both 404 NoSuchKey.
+    client = get_client()
+    bucket = get_new_bucket()
+    check_configure_versioning_retry(bucket, "Enabled", "Enabled")
+    client.put_object(Bucket=bucket, Key='src', Body='one')
+    marker = client.delete_object(Bucket=bucket, Key='src')
+    assert marker['DeleteMarker']
+
+    source = {'Bucket': bucket, 'Key': 'src', 'VersionId': marker['VersionId']}
+    e = assert_raises(ClientError, client.copy_object, Bucket=bucket, Key='dst', CopySource=source)
+    assert _get_status(e.response) == 400
+    e = assert_raises(ClientError, client.copy_object, Bucket=bucket, Key='dst', CopySource={'Bucket': bucket, 'Key': 'src'})
+    assert _get_status(e.response) == 404
+    response = client.list_object_versions(Bucket=bucket, Prefix='dst')
+    assert 'Versions' not in response
+
+@pytest.mark.versioning
+@pytest.mark.fails_on_rgw
+def test_versioning_upload_part_copy_source_delete_marker_version():
+    # An UploadPartCopy whose source names a delete marker's version answers
+    # 400 Bad Request, as one may not copy a delete marker, and stores no
+    # part. RGW answers 404 NoSuchKey.
+    client = get_client()
+    bucket = get_new_bucket()
+    check_configure_versioning_retry(bucket, "Enabled", "Enabled")
+    client.put_object(Bucket=bucket, Key='src', Body='one')
+    marker = client.delete_object(Bucket=bucket, Key='src')
+    assert marker['DeleteMarker']
+    upload_id = client.create_multipart_upload(Bucket=bucket, Key='dst')['UploadId']
+
+    source = {'Bucket': bucket, 'Key': 'src', 'VersionId': marker['VersionId']}
+    e = assert_raises(ClientError, client.upload_part_copy, Bucket=bucket, Key='dst',
+                      UploadId=upload_id, PartNumber=1, CopySource=source)
+    assert _get_status(e.response) == 400
+    response = client.list_parts(Bucket=bucket, Key='dst', UploadId=upload_id)
+    assert 'Parts' not in response or response['Parts'] == []
+    client.abort_multipart_upload(Bucket=bucket, Key='dst', UploadId=upload_id)
+
+@pytest.mark.versioning
 def test_versioning_multi_object_delete():
     bucket_name = get_new_bucket()
     client = get_client()
@@ -22285,6 +22392,23 @@ def test_delete_marker_suspended():
     check_configure_versioning_retry(bucket, "Suspended", "Suspended")
     res = client.delete_object(Bucket=bucket, Key=key)
     check_delete_marker(client, bucket, key, 'true')
+
+@pytest.mark.delete_marker
+@pytest.mark.fails_on_dbstore
+@pytest.mark.versioning
+def test_delete_marker_versioned_get():
+    # A GET of a key whose current version is a delete marker answers 404
+    # NoSuchKey with x-amz-delete-marker: true, as a HEAD does.
+    bucket = get_new_bucket()
+    client = get_client()
+    key = "merry.txt"
+    check_configure_versioning_retry(bucket, "Enabled", "Enabled")
+    client.put_object(Bucket=bucket, Key=key, Body="body version %s" % (key))
+    client.delete_object(Bucket=bucket, Key=key)
+    e = assert_raises(ClientError, client.get_object, Bucket=bucket, Key=key)
+    status, error_code = _get_status_and_error_code(e.response)
+    assert (status, error_code) == (404, 'NoSuchKey')
+    assert e.response['ResponseMetadata']['HTTPHeaders'].get('x-amz-delete-marker') == 'true'
 
 @pytest.mark.delete_marker
 @pytest.mark.lifecycle
