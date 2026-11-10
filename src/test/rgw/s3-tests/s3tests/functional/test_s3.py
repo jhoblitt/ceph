@@ -8088,6 +8088,69 @@ def test_cors_non_preflight_origin_refused():
     writer.put_object(Bucket=bucket_name, Key='baz', Body='bar')
     assert _get_body(client.get_object(Bucket=bucket_name, Key='baz')) == 'bar'
 
+@pytest.mark.fails_on_rgw
+def test_cors_non_preflight_later_rule_allows_method():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    client.put_object(Bucket=bucket_name, Key='foo', Body='bar')
+    cors_config ={
+        'CORSRules': [
+            {'AllowedMethods': ['GET'],
+             'AllowedOrigins': ['example.origin'],
+            },
+            {'AllowedMethods': ['PUT'],
+             'AllowedOrigins': ['example.origin'],
+            },
+        ]
+    }
+    client.put_bucket_cors(Bucket=bucket_name, CORSConfiguration=cors_config)
+
+    time.sleep(3)
+
+    origin_client = _cors_origin_client(get_client(), 'example.origin')
+    response = origin_client.get_object(Bucket=bucket_name, Key='foo')
+    assert _cors_response_allow(response) == ('example.origin', 'GET')
+
+    # the second rule, the first that allows both the origin and the method
+    response = origin_client.put_object(Bucket=bucket_name, Key='baz', Body='bar')
+    assert _cors_response_allow(response) == ('example.origin', 'PUT')
+    assert _get_body(client.get_object(Bucket=bucket_name, Key='baz')) == 'bar'
+
+def test_cors_non_preflight_requested_headers_choose_no_rule():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    client.put_object(Bucket=bucket_name, Key='foo', Body='bar')
+    cors_config ={
+        'CORSRules': [
+            {'AllowedMethods': ['GET'],
+             'AllowedOrigins': ['example.origin'],
+             'AllowedHeaders': ['x-amz-date'],
+            },
+            {'AllowedMethods': ['GET'],
+             'AllowedOrigins': ['example.origin'],
+             'AllowedHeaders': ['x-amz-meta-*'],
+             'ExposeHeaders': ['x-amz-meta-header1'],
+             'MaxAgeSeconds': 600,
+            },
+        ]
+    }
+    client.put_bucket_cors(Bucket=bucket_name, CORSConfiguration=cors_config)
+
+    time.sleep(3)
+
+    # Access-Control-Request-Headers chooses a rule only for a preflight, so
+    # the first rule for the origin and the method answers a GET that names
+    # a header only the second allows, and allows none of its names
+    asks = _cors_headers_client(get_client(), {'Origin': 'example.origin',
+                                               'Access-Control-Request-Headers': 'x-amz-meta-header2'})
+    response = asks.get_object(Bucket=bucket_name, Key='foo')
+    assert _get_body(response) == 'bar'
+    headers = response['ResponseMetadata']['HTTPHeaders']
+    assert _cors_response_allow(response) == ('example.origin', 'GET')
+    assert headers.get('access-control-allow-headers', None) is None
+    assert headers.get('access-control-expose-headers', None) is None
+    assert headers.get('access-control-max-age', None) is None
+
 @pytest.mark.tagging
 def test_set_bucket_tagging():
     bucket_name = get_new_bucket()
