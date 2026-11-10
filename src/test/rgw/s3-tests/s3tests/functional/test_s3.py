@@ -8684,7 +8684,8 @@ def test_versioning_mfa_delete_object_version():
     key = 'obj'
     check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
     version = client.put_object(Bucket=bucket_name, Key=key, Body='data')['VersionId']
-    mfa, step = _mfa_code_after(serial, seed)
+    # a later step than this one, whose code an earlier test may have used
+    mfa, step = _mfa_code_after(serial, seed, int(time.time()) // 30)
     client.put_bucket_versioning(Bucket=bucket_name, MFA=mfa,
                                  VersioningConfiguration={'Status': 'Enabled', 'MFADelete': 'Enabled'})
 
@@ -8720,7 +8721,8 @@ def test_versioning_mfa_delete_objects_version():
     check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
     version = client.put_object(Bucket=bucket_name, Key='a', Body='data')['VersionId']
     client.put_object(Bucket=bucket_name, Key='b', Body='data')
-    mfa, step = _mfa_code_after(serial, seed)
+    # a later step than this one, whose code an earlier test may have used
+    mfa, step = _mfa_code_after(serial, seed, int(time.time()) // 30)
     client.put_bucket_versioning(Bucket=bucket_name, MFA=mfa,
                                  VersioningConfiguration={'Status': 'Enabled', 'MFADelete': 'Enabled'})
 
