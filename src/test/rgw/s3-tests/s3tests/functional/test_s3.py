@@ -16524,6 +16524,65 @@ def test_object_lock_delete_bypass_by_bucket_write_grantee():
     client.delete_object(Bucket=bucket_name, Key=key, VersionId=version_id, BypassGovernanceRetention=True)
 
 
+@pytest.mark.object_lock
+@pytest.mark.bucket_policy
+@pytest.mark.fails_on_dbstore
+@pytest.mark.fails_on_rgw
+def test_object_lock_put_obj_lock_headers_without_put_retention():
+    # TODO: remove fails_on_rgw when RGW checks s3:PutObjectRetention for the
+    # object lock headers of a PutObject
+    bucket_name = get_new_bucket_name()
+    client = get_client()
+    client.create_bucket(Bucket=bucket_name, ObjectLockEnabledForBucket=True)
+    policy = make_json_policy('s3:PutObject', 'arn:aws:s3:::{}/*'.format(bucket_name))
+    client.put_bucket_policy(Bucket=bucket_name, Policy=policy)
+    key = 'file1'
+    retain_until = datetime.datetime.now(pytz.utc) + datetime.timedelta(seconds=10)
+
+    alt_client = get_alt_client()
+    e = assert_raises(ClientError, alt_client.put_object, Bucket=bucket_name, Body='abc', Key=key,
+                      ObjectLockMode='COMPLIANCE', ObjectLockRetainUntilDate=retain_until)
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 403
+    assert error_code == 'AccessDenied'
+    response = client.list_object_versions(Bucket=bucket_name)
+    assert 'Versions' not in response
+
+    response = client.put_object(Bucket=bucket_name, Body='abc', Key=key,
+                                 ObjectLockMode='COMPLIANCE', ObjectLockRetainUntilDate=retain_until)
+    response = client.get_object_retention(Bucket=bucket_name, Key=key, VersionId=response['VersionId'])
+    assert response['Retention']['Mode'] == 'COMPLIANCE'
+
+
+@pytest.mark.object_lock
+@pytest.mark.bucket_policy
+@pytest.mark.fails_on_dbstore
+@pytest.mark.fails_on_rgw
+def test_object_lock_put_obj_retention_by_object_owner_without_put_retention():
+    # TODO: remove fails_on_rgw when RGW stops granting s3:PutObjectRetention
+    # to the owner of an object through the object's ACL
+    bucket_name = get_new_bucket_name()
+    client = get_client()
+    client.create_bucket(Bucket=bucket_name, ObjectLockEnabledForBucket=True)
+    policy = make_json_policy(['s3:PutObject', 's3:GetObjectRetention'], 'arn:aws:s3:::{}/*'.format(bucket_name))
+    client.put_bucket_policy(Bucket=bucket_name, Policy=policy)
+    key = 'file1'
+
+    alt_client = get_alt_client()
+    response = alt_client.put_object(Bucket=bucket_name, Body='abc', Key=key)
+    version_id = response['VersionId']
+    retention = {'Mode':'COMPLIANCE', 'RetainUntilDate':datetime.datetime.now(pytz.utc) + datetime.timedelta(seconds=10)}
+    e = assert_raises(ClientError, alt_client.put_object_retention, Bucket=bucket_name, Key=key,
+                      VersionId=version_id, Retention=retention)
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 403
+    assert error_code == 'AccessDenied'
+    e = assert_raises(ClientError, alt_client.get_object_retention, Bucket=bucket_name, Key=key, VersionId=version_id)
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 404
+    assert error_code == 'ObjectLockConfigurationNotFoundError'
+
+
 @pytest.mark.fails_on_dbstore
 def test_object_lock_put_legal_hold():
     bucket_name = get_new_bucket_name()
