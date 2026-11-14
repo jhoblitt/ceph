@@ -2292,6 +2292,27 @@ def test_object_metadata_replaced_on_put():
     got = response['Metadata']
     assert got == {}
 
+@pytest.mark.fails_on_rgw
+def test_object_metadata_query_string_nul_not_in_header():
+    # RGW takes a PutObject's x-amz-meta-* query parameters for metadata, and
+    # %00 in a value decodes to a NUL, which a header cannot carry and no
+    # field value may hold (RFC 9110 section 5.5). Whatever a gateway stores,
+    # its GET and HEAD must send no NUL in a header.
+    # TODO: remove fails_on_rgw when RGW stops sending a stored NUL in a header
+    bucket_name = get_new_bucket()
+    client = get_client()
+
+    def add_meta(**kwargs):
+        sep = '&' if '?' in kwargs['params']['url'] else '?'
+        kwargs['params']['url'] += sep + 'x-amz-meta-meta1=b%00c'
+    client.meta.events.register('before-call.s3.PutObject', add_meta)
+    client.put_object(Bucket=bucket_name, Key='foo', Body='bar')
+
+    for response in (client.get_object(Bucket=bucket_name, Key='foo'),
+                     client.head_object(Bucket=bucket_name, Key='foo')):
+        headers = response['ResponseMetadata']['HTTPHeaders']
+        assert [name for name, value in headers.items() if '\x00' in value] == []
+
 def test_object_put_annotation_keeps_object():
     # PutObjectAnnotation leaves the object's data and metadata, whether or
     # not the gateway serves it. RGW has no op for ?annotation: it serves the
