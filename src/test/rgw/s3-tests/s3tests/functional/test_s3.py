@@ -16974,6 +16974,55 @@ def test_bucket_policy_allow_notprincipal():
     assert error_code == 'InvalidArgument' or error_code == 'MalformedPolicy'
 
 
+@pytest.mark.bucket_policy
+@pytest.mark.fails_on_rgw
+def test_bucket_policy_deny_notaction():
+    # TODO: remove fails_on_rgw when https://tracker.ceph.com/issues/73983 is resolved
+    bucket_name = get_new_bucket()
+    client = get_client()
+    key = 'asdf'
+    client.put_object(Bucket=bucket_name, Key=key, Body='asdf')
+
+    alt_principal = {"AWS": "arn:aws:iam:::user/{}".format(get_alt_user_id())}
+    resources = ["arn:aws:s3:::" + bucket_name, "arn:aws:s3:::" + bucket_name + "/*"]
+    policy_document = json.dumps(
+    {
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": alt_principal,
+            "Action": "s3:*",
+            "Resource": resources
+        }, {
+            "Effect": "Deny",
+            "Principal": alt_principal,
+            "NotAction": "s3:GetObject",
+            "Resource": resources
+        }]
+    })
+    client.put_bucket_policy(Bucket=bucket_name, Policy=policy_document)
+
+    alt_client = get_alt_client()
+    response = alt_client.get_object(Bucket=bucket_name, Key=key)
+    assert _get_body(response) == 'asdf'
+
+    e = assert_raises(ClientError, alt_client.put_object, Bucket=bucket_name, Key='new', Body='new')
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 403
+    assert error_code == 'AccessDenied'
+
+    e = assert_raises(ClientError, alt_client.delete_object, Bucket=bucket_name, Key=key)
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 403
+    assert error_code == 'AccessDenied'
+
+    response = client.get_object(Bucket=bucket_name, Key=key)
+    assert _get_body(response) == 'asdf'
+    e = assert_raises(ClientError, client.head_object, Bucket=bucket_name, Key='new')
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 404
+
+
 def test_get_undefined_public_block():
     bucket_name = get_new_bucket()
     client = get_client()
