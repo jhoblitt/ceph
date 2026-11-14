@@ -13197,6 +13197,44 @@ def test_encryption_sse_c_other_key():
     assert status == 400
 
 @pytest.mark.encryption
+def test_encryption_sse_c_empty_algorithm():
+    # RGW files a header sent with no value as present, so its check of the
+    # algorithm finds a value that is not AES256, where a header left out is
+    # a missing algorithm. The key headers are the ones the object was
+    # written with in both requests.
+    bucket_name = get_new_bucket()
+    client = get_client()
+    data = 'A'*1000
+    key = 'testobj'
+    sse_key_headers = {
+        'x-amz-server-side-encryption-customer-key': 'pO3upElrwuEXSoFwCfnZPdSsmt/xWeFa0N9KgDijwVs=',
+        'x-amz-server-side-encryption-customer-key-md5': 'DWygnHRtgiJ77HCm+1rvHw=='
+    }
+    sse_client_headers = {'x-amz-server-side-encryption-customer-algorithm': 'AES256'}
+    sse_client_headers.update(sse_key_headers)
+
+    lf = (lambda **kwargs: kwargs['params']['headers'].update(sse_client_headers))
+    client.meta.events.register('before-call.s3.PutObject', lf)
+    client.put_object(Bucket=bucket_name, Key=key, Body=data)
+
+    sse_empty_headers = {'x-amz-server-side-encryption-customer-algorithm': ''}
+    sse_empty_headers.update(sse_key_headers)
+    lf = (lambda **kwargs: kwargs['params']['headers'].update(sse_empty_headers))
+    client.meta.events.register('before-call.s3.GetObject', lf)
+    e = assert_raises(ClientError, client.get_object, Bucket=bucket_name, Key=key)
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 400
+    assert error_code == 'InvalidEncryptionAlgorithmError'
+
+    client.meta.events.unregister('before-call.s3.GetObject', lf)
+    lf = (lambda **kwargs: kwargs['params']['headers'].update(sse_key_headers))
+    client.meta.events.register('before-call.s3.GetObject', lf)
+    e = assert_raises(ClientError, client.get_object, Bucket=bucket_name, Key=key)
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 400
+    assert error_code == 'InvalidArgument'
+
+@pytest.mark.encryption
 def test_encryption_sse_c_invalid_md5():
     bucket_name = get_new_bucket()
     client = get_client()
@@ -22857,6 +22895,36 @@ def test_get_sse_c_encrypted_object_attributes():
     assert response['ETag'] == etag
     assert response['StorageClass'] == 'STANDARD'
     assert 'ObjectParts' not in response
+
+@pytest.mark.encryption
+@pytest.mark.fails_on_dbstore
+def test_get_sse_c_encrypted_object_attributes_empty_algorithm():
+    # GetObjectAttributes makes the checks of a GET of an SSE-C object, and
+    # an algorithm header sent with no value is no AES256 to them, where a
+    # header left out is a missing algorithm.
+    bucket_name = get_new_bucket()
+    client = get_client()
+    key = 'obj'
+    sse_args = {
+        'SSECustomerAlgorithm': 'AES256',
+        'SSECustomerKey': 'pO3upElrwuEXSoFwCfnZPdSsmt/xWeFa0N9KgDijwVs=',
+        'SSECustomerKeyMD5': 'DWygnHRtgiJ77HCm+1rvHw=='
+    }
+    attrs = ['ETag', 'ObjectSize']
+    client.put_object(Bucket=bucket_name, Key=key, Body='A'*1000, **sse_args)
+
+    sse_empty_headers = {
+        'x-amz-server-side-encryption-customer-algorithm': '',
+        'x-amz-server-side-encryption-customer-key': sse_args['SSECustomerKey'],
+        'x-amz-server-side-encryption-customer-key-md5': sse_args['SSECustomerKeyMD5']
+    }
+    lf = (lambda **kwargs: kwargs['params']['headers'].update(sse_empty_headers))
+    client.meta.events.register('before-call.s3.GetObjectAttributes', lf)
+    e = assert_raises(ClientError, client.get_object_attributes,
+                      Bucket=bucket_name, Key=key, ObjectAttributes=attrs)
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 400
+    assert error_code == 'InvalidEncryptionAlgorithmError'
 
 @pytest.mark.fails_on_dbstore
 def test_get_object_attributes():
