@@ -11133,6 +11133,42 @@ def test_lifecycle_expiration_header_upload_part():
                                        PartNumber=2, CopySource={'Bucket': bucket_name, 'Key': 'days1/foo'})
     assert 'x-amz-expiration' not in response['ResponseMetadata']['HTTPHeaders']
 
+def _setup_lifecycle_expiration_over(client, bucket_name, size):
+    rules = [{'ID': 'rule1', 'Expiration': {'Days': 1},
+              'Filter': {'Prefix': '', 'ObjectSizeGreaterThan': size},
+              'Status': 'Enabled'}]
+    response = client.put_bucket_lifecycle_configuration(
+        Bucket=bucket_name, LifecycleConfiguration={'Rules': rules})
+    assert response['ResponseMetadata']['HTTPStatusCode'] == 200
+
+# TODO: remove fails_on_rgw when RGW's x-amz-expiration leaves out a rule
+# whose object-size filter excludes the object:
+# https://github.com/jhoblitt/rgw-go/blob/main/docs/ceph-upstream-bugs.md#radosgws-x-amz-expiration-ignores-a-rules-object-size-filter
+@pytest.mark.lifecycle
+@pytest.mark.fails_on_rgw
+def test_lifecycle_expiration_header_size_excluded():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    _setup_lifecycle_expiration_over(client, bucket_name, 4)
+
+    response = client.put_object(Bucket=bucket_name, Key='small', Body='abc')
+    assert 'x-amz-expiration' not in response['ResponseMetadata']['HTTPHeaders']
+    response = client.head_object(Bucket=bucket_name, Key='small')
+    assert 'x-amz-expiration' not in response['ResponseMetadata']['HTTPHeaders']
+
+@pytest.mark.lifecycle
+def test_lifecycle_expiration_header_size_included():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    _setup_lifecycle_expiration_over(client, bucket_name, 4)
+
+    now = datetime.datetime.utcnow()
+    response = client.put_object(Bucket=bucket_name, Key='large', Body='abcdefgh')
+    end = datetime.datetime.utcnow()
+    assert check_lifecycle_expiration_header(response, now, end, 'rule1', 1)
+    response = client.head_object(Bucket=bucket_name, Key='large')
+    assert check_lifecycle_expiration_header(response, now, end, 'rule1', 1)
+
 @pytest.mark.lifecycle
 def test_lifecycle_set_noncurrent():
     bucket_name = _create_objects(keys=['past/foo', 'future/bar'])
