@@ -10951,7 +10951,7 @@ def setup_lifecycle_expiration(client, bucket_name, rule_id, delta_days,
     assert response['ResponseMetadata']['HTTPStatusCode'] == 200
     return response
 
-def check_lifecycle_expiration_header(response, start_time, rule_id,
+def check_lifecycle_expiration_header(response, start_time, end_time, rule_id,
                                       delta_days):
     expr_exists = ('x-amz-expiration' in response['ResponseMetadata']['HTTPHeaders'])
     if (not expr_exists):
@@ -10960,8 +10960,15 @@ def check_lifecycle_expiration_header(response, start_time, rule_id,
 
     m = re.search(r'expiry-date="(.+)", rule-id="(.+)"', expr_hdr)
 
-    expiration = dateutil.parser.parse(m.group(1))
-    days_to_expire = ((expiration.replace(tzinfo=None) - start_time).days == delta_days)
+    # the expiry date is a midnight UTC, delta_days after the object's mtime
+    # rounded up to a midnight, which gateways do in more than one way; the
+    # mtime lies between start_time, taken before the write, and end_time,
+    # taken after its response, both naive UTC
+    expiration = dateutil.parser.parse(m.group(1)).replace(tzinfo=None)
+    earliest = start_time.replace(microsecond=0) + datetime.timedelta(days=delta_days)
+    latest = end_time + datetime.timedelta(days=delta_days + 1)
+    days_to_expire = (expiration.time() == datetime.time(0) and
+                      earliest <= expiration <= latest)
     rule_eq_id = (m.group(2) == rule_id)
 
     return  days_to_expire and rule_eq_id
@@ -10975,7 +10982,8 @@ def test_lifecycle_expiration_header_put():
     now = datetime.datetime.utcnow()
     response = setup_lifecycle_expiration(
         client, bucket_name, 'rule1', 1, 'days1/')
-    assert check_lifecycle_expiration_header(response, now, 'rule1', 1)
+    end = datetime.datetime.utcnow()
+    assert check_lifecycle_expiration_header(response, now, end, 'rule1', 1)
 
 @pytest.mark.lifecycle
 @pytest.mark.lifecycle_expiration
@@ -10987,13 +10995,14 @@ def test_lifecycle_expiration_header_head():
     now = datetime.datetime.utcnow()
     response = setup_lifecycle_expiration(
         client, bucket_name, 'rule1', 1, 'days1/')
+    end = datetime.datetime.utcnow()
 
     key = 'days1/' + 'foo'
 
     # stat the object, check header
     response = client.head_object(Bucket=bucket_name, Key=key)
     assert response['ResponseMetadata']['HTTPStatusCode'] == 200
-    assert check_lifecycle_expiration_header(response, now, 'rule1', 1)
+    assert check_lifecycle_expiration_header(response, now, end, 'rule1', 1)
 
 @pytest.mark.lifecycle
 @pytest.mark.lifecycle_expiration
@@ -11021,13 +11030,15 @@ def test_lifecycle_expiration_header_tags_head():
     body1 = "obj_key1_body"
     tags1={'TagSet': [{'Key': 'key1', 'Value': 'tag1'},
           {'Key': 'key5','Value': 'tag5'}]}
+    now = datetime.datetime.utcnow()
     response = client.put_object(Bucket=bucket_name, Key=key1, Body=body1)
     response = client.put_object_tagging(Bucket=bucket_name, Key=key1,Tagging=tags1)
+    end = datetime.datetime.utcnow()
 
     # stat the object, check header
     response = client.head_object(Bucket=bucket_name, Key=key1)
     assert response['ResponseMetadata']['HTTPStatusCode'] == 200
-    assert check_lifecycle_expiration_header(response, datetime.datetime.now(None), 'rule1', 1)
+    assert check_lifecycle_expiration_header(response, now, end, 'rule1', 1)
 
     # test that header is not returning when it should not
     lifecycle={
@@ -11049,7 +11060,7 @@ def test_lifecycle_expiration_header_tags_head():
     # stat the object, check header
     response = client.head_object(Bucket=bucket_name, Key=key1)
     assert response['ResponseMetadata']['HTTPStatusCode'] == 200
-    assert check_lifecycle_expiration_header(response, datetime.datetime.now(None), 'rule1', 1) == False
+    assert check_lifecycle_expiration_header(response, now, end, 'rule1', 1) == False
 
 @pytest.mark.lifecycle
 @pytest.mark.lifecycle_expiration
@@ -11091,11 +11102,12 @@ def test_lifecycle_expiration_header_and_tags_head():
           {'Key': 'key5','Value': 'tag5'}]}
     response = client.put_object(Bucket=bucket_name, Key=key1, Body=body1)
     response = client.put_object_tagging(Bucket=bucket_name, Key=key1,Tagging=tags1)
+    end = datetime.datetime.utcnow()
 
     # stat the object, check header
     response = client.head_object(Bucket=bucket_name, Key=key1)
     assert response['ResponseMetadata']['HTTPStatusCode'] == 200
-    assert check_lifecycle_expiration_header(response, datetime.datetime.now(None), 'rule1', 1) == False
+    assert check_lifecycle_expiration_header(response, now, end, 'rule1', 1) == False
 
 # TODO: remove fails_on_rgw when RGW sends no x-amz-expiration on UploadPart
 # and UploadPartCopy:
@@ -11109,7 +11121,8 @@ def test_lifecycle_expiration_header_upload_part():
     now = datetime.datetime.utcnow()
     response = setup_lifecycle_expiration(
         client, bucket_name, 'rule1', 1, 'days1/')
-    assert check_lifecycle_expiration_header(response, now, 'rule1', 1)
+    end = datetime.datetime.utcnow()
+    assert check_lifecycle_expiration_header(response, now, end, 'rule1', 1)
 
     key = 'days1/mp'
     upload_id = client.create_multipart_upload(Bucket=bucket_name, Key=key)['UploadId']
