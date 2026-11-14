@@ -11097,6 +11097,29 @@ def test_lifecycle_expiration_header_and_tags_head():
     assert response['ResponseMetadata']['HTTPStatusCode'] == 200
     assert check_lifecycle_expiration_header(response, datetime.datetime.now(None), 'rule1', 1) == False
 
+# TODO: remove fails_on_rgw when RGW sends no x-amz-expiration on UploadPart
+# and UploadPartCopy:
+# https://github.com/jhoblitt/rgw-go/blob/main/docs/ceph-upstream-bugs.md#radosgws-lifecycle-headers-depart-from-s3s-response-model
+@pytest.mark.lifecycle
+@pytest.mark.fails_on_rgw
+def test_lifecycle_expiration_header_upload_part():
+    bucket_name = get_new_bucket()
+    client = get_client()
+
+    now = datetime.datetime.utcnow()
+    response = setup_lifecycle_expiration(
+        client, bucket_name, 'rule1', 1, 'days1/')
+    assert check_lifecycle_expiration_header(response, now, 'rule1', 1)
+
+    key = 'days1/mp'
+    upload_id = client.create_multipart_upload(Bucket=bucket_name, Key=key)['UploadId']
+    response = client.upload_part(Bucket=bucket_name, Key=key, UploadId=upload_id,
+                                  PartNumber=1, Body='bar')
+    assert 'x-amz-expiration' not in response['ResponseMetadata']['HTTPHeaders']
+    response = client.upload_part_copy(Bucket=bucket_name, Key=key, UploadId=upload_id,
+                                       PartNumber=2, CopySource={'Bucket': bucket_name, 'Key': 'days1/foo'})
+    assert 'x-amz-expiration' not in response['ResponseMetadata']['HTTPHeaders']
+
 @pytest.mark.lifecycle
 def test_lifecycle_set_noncurrent():
     bucket_name = _create_objects(keys=['past/foo', 'future/bar'])
