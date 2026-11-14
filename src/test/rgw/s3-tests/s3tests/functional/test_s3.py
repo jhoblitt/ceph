@@ -22812,6 +22812,41 @@ def test_get_object_attributes():
     assert 'ObjectParts' not in response
 
 
+@pytest.mark.bucket_policy
+@pytest.mark.fails_on_dbstore
+@pytest.mark.fails_on_rgw
+def test_get_object_attributes_needs_get_object():
+    # TODO: remove fails_on_rgw once the RGW under test requires both actions,
+    # as it has since v21.0.0 (https://tracker.ceph.com/issues/72915)
+    bucket_name = get_new_bucket()
+    client = get_client()
+    key = 'obj'
+    response = client.put_object(Bucket=bucket_name, Key=key, Body='foo')
+    etag = response['ETag'].strip('"')
+
+    resource = _make_arn_resource('{}/{}'.format(bucket_name, '*'))
+    alt = {'AWS': ['arn:aws:iam:::user/{}'.format(get_alt_user_id())]}
+    allow = Statement(['s3:GetObject', 's3:GetObjectAttributes'], resource, principal=alt)
+    client.put_bucket_policy(Bucket=bucket_name, Policy=Policy().add_statement(allow).to_json())
+
+    alt_client = get_alt_client()
+    attrs = ['ETag', 'ObjectSize']
+    response = alt_client.get_object_attributes(Bucket=bucket_name, Key=key, ObjectAttributes=attrs)
+    assert response['ETag'] == etag
+    assert response['ObjectSize'] == 3
+
+    deny = Statement('s3:GetObject', resource, principal=alt, effect='Deny')
+    policy = Policy().add_statement(allow).add_statement(deny).to_json()
+    client.put_bucket_policy(Bucket=bucket_name, Policy=policy)
+
+    check_access_denied(alt_client.get_object, Bucket=bucket_name, Key=key)
+    e = assert_raises(ClientError, alt_client.get_object_attributes,
+                      Bucket=bucket_name, Key=key, ObjectAttributes=attrs)
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 403
+    assert error_code == 'AccessDenied'
+
+
 def test_upload_part_copy_percent_encoded_key():
     
     s3_client = get_client()
