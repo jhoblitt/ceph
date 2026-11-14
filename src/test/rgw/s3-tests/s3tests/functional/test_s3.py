@@ -11307,6 +11307,32 @@ def test_lifecycle_multipart_expiration():
     assert len(init_uploads) == 2
     assert len(expired_uploads) == 1
 
+# TODO: remove fails_on_rgw when RGW counts x-amz-abort-date from the upload's
+# initiation:
+# https://github.com/jhoblitt/rgw-go/blob/main/docs/ceph-upstream-bugs.md#radosgws-x-amz-abort-date-counts-from-1970
+@pytest.mark.lifecycle
+@pytest.mark.fails_on_rgw
+def test_lifecycle_multipart_abort_date_header():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    rules = [
+        {'ID': 'rule1', 'Prefix': 'test1/', 'Status': 'Enabled',
+         'AbortIncompleteMultipartUpload': {'DaysAfterInitiation': 2}},
+    ]
+    lifecycle = {'Rules': rules}
+    client.put_bucket_lifecycle_configuration(Bucket=bucket_name, LifecycleConfiguration=lifecycle)
+
+    # the date is the initiation plus the days, rounded up to a midnight UTC
+    now = datetime.datetime.now(pytz.utc).replace(microsecond=0)
+    response = client.create_multipart_upload(Bucket=bucket_name, Key='test1/a')
+    assert response['AbortRuleId'] == 'rule1'
+    assert response['AbortDate'] >= now + datetime.timedelta(days=2)
+    assert response['AbortDate'] <= now + datetime.timedelta(days=3)
+
+    response = client.create_multipart_upload(Bucket=bucket_name, Key='test2/a')
+    assert 'AbortDate' not in response
+    assert 'AbortRuleId' not in response
+
 @pytest.mark.lifecycle
 def test_lifecycle_transition_set_invalid_date():
     bucket_name = get_new_bucket()
