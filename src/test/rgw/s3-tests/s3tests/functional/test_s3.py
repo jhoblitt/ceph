@@ -16716,6 +16716,42 @@ def test_object_lock_put_obj_retention_by_object_owner_without_put_retention():
     assert error_code == 'ObjectLockConfigurationNotFoundError'
 
 
+@pytest.mark.object_lock
+@pytest.mark.bucket_policy
+@pytest.mark.fails_on_dbstore
+@pytest.mark.fails_on_rgw
+def test_object_lock_put_obj_mode_denied_by_policy_condition():
+    # TODO: remove fails_on_rgw when RGW sets the s3:object-lock-mode
+    # condition key for a PutObject that names a retention
+    bucket_name = get_new_bucket_name()
+    client = get_client()
+    client.create_bucket(Bucket=bucket_name, ObjectLockEnabledForBucket=True)
+    deny_compliance = {
+        "StringEquals": {
+            "s3:object-lock-mode": "COMPLIANCE"
+        }
+    }
+    resource = _make_arn_resource("{}/{}".format(bucket_name, "*"))
+    s = Statement("s3:PutObject", resource, effect="Deny", condition=deny_compliance)
+    policy_document = Policy().add_statement(s).to_json()
+    client.put_bucket_policy(Bucket=bucket_name, Policy=policy_document)
+    key = 'file1'
+    retain_until = datetime.datetime.now(pytz.utc) + datetime.timedelta(seconds=10)
+
+    e = assert_raises(ClientError, client.put_object, Bucket=bucket_name, Body='abc', Key=key,
+                      ObjectLockMode='COMPLIANCE', ObjectLockRetainUntilDate=retain_until)
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 403
+    assert error_code == 'AccessDenied'
+    response = client.list_object_versions(Bucket=bucket_name)
+    assert 'Versions' not in response
+
+    response = client.put_object(Bucket=bucket_name, Body='abc', Key=key,
+                                 ObjectLockMode='GOVERNANCE', ObjectLockRetainUntilDate=retain_until)
+    response = client.get_object_retention(Bucket=bucket_name, Key=key, VersionId=response['VersionId'])
+    assert response['Retention']['Mode'] == 'GOVERNANCE'
+
+
 @pytest.mark.fails_on_dbstore
 def test_object_lock_put_legal_hold():
     bucket_name = get_new_bucket_name()
