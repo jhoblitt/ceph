@@ -14635,6 +14635,82 @@ def test_bucket_policy_set_condition_operator_end_with_IfExists():
     print(response)
 
 @pytest.mark.bucket_policy
+@pytest.mark.fails_on_rgw
+def test_bucket_policy_deny_stringnotlike_key_absent():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    key = 'foo'
+    client.put_object(Bucket=bucket_name, Key=key, Body='foo')
+    policy_document = json.dumps(
+    {
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "s3:GetObject",
+            "Resource": "arn:aws:s3:::{}/*".format(bucket_name),
+            "Condition": {
+                "StringNotLike": {
+                    "aws:Referer": "http://www.example.com/*"
+                }
+            }
+        }]
+    })
+    client.put_bucket_policy(Bucket=bucket_name, Policy=policy_document)
+
+    request_headers = {}
+    lf = (lambda **kwargs: kwargs['params']['headers'].update(request_headers))
+    client.meta.events.register('before-call.s3.GetObject', lf)
+
+    e = assert_raises(ClientError, client.get_object, Bucket=bucket_name, Key=key)
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 403
+    assert error_code == 'AccessDenied'
+
+    request_headers['referer'] = 'http://www.example.com/index.html'
+    response = client.get_object(Bucket=bucket_name, Key=key)
+    assert _get_body(response) == 'foo'
+
+    request_headers['referer'] = 'http://example.com'
+    e = assert_raises(ClientError, client.get_object, Bucket=bucket_name, Key=key)
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 403
+    assert error_code == 'AccessDenied'
+
+@pytest.mark.bucket_policy
+@pytest.mark.fails_on_rgw
+def test_bucket_policy_deny_null_false_key_present():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    key = 'foo'
+    client.put_object(Bucket=bucket_name, Key=key, Body='foo')
+    policy_document = json.dumps(
+    {
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "s3:GetObject",
+            "Resource": "arn:aws:s3:::{}/*".format(bucket_name),
+            "Condition": {
+                "Null": {
+                    "aws:Referer": "false"
+                }
+            }
+        }]
+    })
+    client.put_bucket_policy(Bucket=bucket_name, Policy=policy_document)
+
+    request_headers = {'referer': 'http://www.example.com/index.html'}
+    lf = (lambda **kwargs: kwargs['params']['headers'].update(request_headers))
+    client.meta.events.register('before-call.s3.GetObject', lf)
+
+    e = assert_raises(ClientError, client.get_object, Bucket=bucket_name, Key=key)
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 403
+    assert error_code == 'AccessDenied'
+
+@pytest.mark.bucket_policy
 def test_set_get_del_bucket_policy():
     bucket_name = get_new_bucket()
     client = get_client()
