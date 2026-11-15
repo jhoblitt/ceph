@@ -17142,65 +17142,6 @@ def test_bucket_policy_deny_notaction():
     assert status == 404
 
 
-def _put_policy_for_alt_writes(client, bucket_name, actions, *statements):
-    # The alt user may do actions on the bucket's objects, and statements
-    # (each a dict without Principal or Resource) add to or limit that.
-    alt_principal = {"AWS": "arn:aws:iam:::user/{}".format(get_alt_user_id())}
-    resource = "arn:aws:s3:::" + bucket_name + "/*"
-    policy_document = json.dumps(
-    {
-        "Version": "2012-10-17",
-        "Statement": [dict(s, Principal=alt_principal, Resource=resource) for s in (
-            {"Effect": "Allow", "Action": actions},
-        ) + statements]
-    })
-    client.put_bucket_policy(Bucket=bucket_name, Policy=policy_document)
-
-
-def _alt_writes_setting(alt_client, bucket_name, source_key, **setting):
-    # The three writes that take an ACL and tags, each as a callable of the
-    # key it writes, setting the same.
-    copy_source = {'Bucket': bucket_name, 'Key': source_key}
-    copy_setting = dict(setting)
-    if 'Tagging' in setting:
-        copy_setting['TaggingDirective'] = 'REPLACE'
-    return {
-        'put_object': lambda key: alt_client.put_object(Bucket=bucket_name, Key=key, Body='asdf', **setting),
-        'copy_object': lambda key: alt_client.copy_object(Bucket=bucket_name, Key=key, CopySource=copy_source, **copy_setting),
-        'create_multipart_upload': lambda key: alt_client.create_multipart_upload(Bucket=bucket_name, Key=key, **setting),
-    }
-
-
-def _assert_alt_writes_refused(client, bucket_name, writes):
-    # Each write is 403 AccessDenied and writes nothing: no object, no upload.
-    for name, write in writes.items():
-        key = 'refused-' + name
-        e = assert_raises(ClientError, write, key)
-        status, error_code = _get_status_and_error_code(e.response)
-        assert status == 403, name
-        assert error_code == 'AccessDenied', name
-        e = assert_raises(ClientError, client.head_object, Bucket=bucket_name, Key=key)
-        status, error_code = _get_status_and_error_code(e.response)
-        assert status == 404, name
-    assert 'Uploads' not in client.list_multipart_uploads(Bucket=bucket_name)
-
-
-def _assert_alt_writes_served(client, alt_client, bucket_name, writes):
-    # Each write succeeds: the alt user, who owns what it writes, finds the
-    # object, and the bucket's owner aborts an upload.
-    for name, write in writes.items():
-        key = 'served-' + name
-        response = write(key)
-        if name == 'create_multipart_upload':
-            client.abort_multipart_upload(Bucket=bucket_name, Key=key, UploadId=response['UploadId'])
-        else:
-            alt_client.head_object(Bucket=bucket_name, Key=key)
-
-
-# The alt user may read and write objects, and set their ACLs and tags.
-_ALT_WRITE_ACTIONS = ["s3:GetObject", "s3:PutObject", "s3:PutObjectAcl", "s3:PutObjectTagging"]
-
-
 @pytest.mark.bucket_policy
 @pytest.mark.fails_on_rgw
 def test_bucket_policy_deny_put_object_acl_header():
@@ -17209,20 +17150,68 @@ def test_bucket_policy_deny_put_object_acl_header():
     bucket_name = get_new_bucket()
     client = get_client()
     client.put_object(Bucket=bucket_name, Key='source', Body='asdf')
-    _put_policy_for_alt_writes(client, bucket_name, _ALT_WRITE_ACTIONS,
-                               {"Effect": "Deny", "Action": "s3:PutObjectAcl"})
     alt_client = get_alt_client()
 
+    # The alt user may read and write objects, and set their ACLs and tags,
+    # but is denied s3:PutObjectAcl.
+    alt_principal = {"AWS": "arn:aws:iam:::user/{}".format(get_alt_user_id())}
+    resource = "arn:aws:s3:::" + bucket_name + "/*"
+    policy_document = json.dumps(
+    {
+        "Version": "2012-10-17",
+        "Statement": [
+            {"Effect": "Allow", "Principal": alt_principal, "Resource": resource,
+             "Action": ["s3:GetObject", "s3:PutObject", "s3:PutObjectAcl", "s3:PutObjectTagging"]},
+            {"Effect": "Deny", "Principal": alt_principal, "Resource": resource,
+             "Action": "s3:PutObjectAcl"},
+        ]
+    })
+    client.put_bucket_policy(Bucket=bucket_name, Policy=policy_document)
+
+    # The three writes that take an ACL and tags, each as a callable of the
+    # key it writes, setting the same.
+    copy_source = {'Bucket': bucket_name, 'Key': 'source'}
+
     def writes(**setting):
-        return _alt_writes_setting(alt_client, bucket_name, 'source', **setting)
+        copy_setting = dict(setting)
+        if 'Tagging' in setting:
+            copy_setting['TaggingDirective'] = 'REPLACE'
+        return {
+            'put_object': lambda key: alt_client.put_object(Bucket=bucket_name, Key=key, Body='asdf', **setting),
+            'copy_object': lambda key: alt_client.copy_object(Bucket=bucket_name, Key=key, CopySource=copy_source, **copy_setting),
+            'create_multipart_upload': lambda key: alt_client.create_multipart_upload(Bucket=bucket_name, Key=key, **setting),
+        }
+
+    def served(**setting):
+        # Each write succeeds: the alt user, who owns what it writes, finds the
+        # object, and the bucket's owner aborts an upload.
+        for name, write in writes(**setting).items():
+            key = 'served-' + name
+            response = write(key)
+            if name == 'create_multipart_upload':
+                client.abort_multipart_upload(Bucket=bucket_name, Key=key, UploadId=response['UploadId'])
+            else:
+                alt_client.head_object(Bucket=bucket_name, Key=key)
+
+    def refused(**setting):
+        # Each write is 403 AccessDenied and writes nothing: no object, no upload.
+        for name, write in writes(**setting).items():
+            key = 'refused-' + name
+            e = assert_raises(ClientError, write, key)
+            status, error_code = _get_status_and_error_code(e.response)
+            assert status == 403, name
+            assert error_code == 'AccessDenied', name
+            e = assert_raises(ClientError, client.head_object, Bucket=bucket_name, Key=key)
+            status, error_code = _get_status_and_error_code(e.response)
+            assert status == 404, name
+        assert 'Uploads' not in client.list_multipart_uploads(Bucket=bucket_name)
 
     # A write that sets no ACL, or tags, is served.
-    _assert_alt_writes_served(client, alt_client, bucket_name, writes())
-    _assert_alt_writes_served(client, alt_client, bucket_name, writes(Tagging='key1=value1'))
+    served()
+    served(Tagging='key1=value1')
     # A write that sets an ACL is refused, by a canned ACL or a grant header.
-    _assert_alt_writes_refused(client, bucket_name, writes(ACL='public-read'))
-    _assert_alt_writes_refused(client, bucket_name, writes(
-        GrantRead='uri="http://acs.amazonaws.com/groups/global/AllUsers"'))
+    refused(ACL='public-read')
+    refused(GrantRead='uri="http://acs.amazonaws.com/groups/global/AllUsers"')
 
 
 @pytest.mark.tagging
@@ -17235,18 +17224,67 @@ def test_bucket_policy_deny_put_object_tagging_header():
     bucket_name = get_new_bucket()
     client = get_client()
     client.put_object(Bucket=bucket_name, Key='source', Body='asdf')
-    _put_policy_for_alt_writes(client, bucket_name, _ALT_WRITE_ACTIONS,
-                               {"Effect": "Deny", "Action": "s3:PutObjectTagging"})
     alt_client = get_alt_client()
 
+    # The alt user may read and write objects, and set their ACLs and tags,
+    # but is denied s3:PutObjectTagging.
+    alt_principal = {"AWS": "arn:aws:iam:::user/{}".format(get_alt_user_id())}
+    resource = "arn:aws:s3:::" + bucket_name + "/*"
+    policy_document = json.dumps(
+    {
+        "Version": "2012-10-17",
+        "Statement": [
+            {"Effect": "Allow", "Principal": alt_principal, "Resource": resource,
+             "Action": ["s3:GetObject", "s3:PutObject", "s3:PutObjectAcl", "s3:PutObjectTagging"]},
+            {"Effect": "Deny", "Principal": alt_principal, "Resource": resource,
+             "Action": "s3:PutObjectTagging"},
+        ]
+    })
+    client.put_bucket_policy(Bucket=bucket_name, Policy=policy_document)
+
+    # The three writes that take an ACL and tags, each as a callable of the
+    # key it writes, setting the same.
+    copy_source = {'Bucket': bucket_name, 'Key': 'source'}
+
     def writes(**setting):
-        return _alt_writes_setting(alt_client, bucket_name, 'source', **setting)
+        copy_setting = dict(setting)
+        if 'Tagging' in setting:
+            copy_setting['TaggingDirective'] = 'REPLACE'
+        return {
+            'put_object': lambda key: alt_client.put_object(Bucket=bucket_name, Key=key, Body='asdf', **setting),
+            'copy_object': lambda key: alt_client.copy_object(Bucket=bucket_name, Key=key, CopySource=copy_source, **copy_setting),
+            'create_multipart_upload': lambda key: alt_client.create_multipart_upload(Bucket=bucket_name, Key=key, **setting),
+        }
+
+    def served(**setting):
+        # Each write succeeds: the alt user, who owns what it writes, finds the
+        # object, and the bucket's owner aborts an upload.
+        for name, write in writes(**setting).items():
+            key = 'served-' + name
+            response = write(key)
+            if name == 'create_multipart_upload':
+                client.abort_multipart_upload(Bucket=bucket_name, Key=key, UploadId=response['UploadId'])
+            else:
+                alt_client.head_object(Bucket=bucket_name, Key=key)
+
+    def refused(**setting):
+        # Each write is 403 AccessDenied and writes nothing: no object, no upload.
+        for name, write in writes(**setting).items():
+            key = 'refused-' + name
+            e = assert_raises(ClientError, write, key)
+            status, error_code = _get_status_and_error_code(e.response)
+            assert status == 403, name
+            assert error_code == 'AccessDenied', name
+            e = assert_raises(ClientError, client.head_object, Bucket=bucket_name, Key=key)
+            status, error_code = _get_status_and_error_code(e.response)
+            assert status == 404, name
+        assert 'Uploads' not in client.list_multipart_uploads(Bucket=bucket_name)
 
     # A write that sets no tags, or an ACL, is served.
-    _assert_alt_writes_served(client, alt_client, bucket_name, writes())
-    _assert_alt_writes_served(client, alt_client, bucket_name, writes(ACL='public-read'))
+    served()
+    served(ACL='public-read')
     # A write that sets tags is refused.
-    _assert_alt_writes_refused(client, bucket_name, writes(Tagging='key1=value1'))
+    refused(Tagging='key1=value1')
 
 
 def test_get_undefined_public_block():
