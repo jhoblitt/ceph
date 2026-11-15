@@ -11206,34 +11206,32 @@ def test_lifecycle_expiration_header_size_included():
 
 @pytest.mark.lifecycle
 @pytest.mark.fails_on_rgw
-@pytest.mark.parametrize('rule_id', [
-    'expire old, "logs"=1',
-    'x", expiry-date="Fri, 01 Jan 2100 00:00:00 GMT',
-], ids=['punctuation', 'forged_expiry_date'])
-def test_lifecycle_expiration_header_rule_id_url_encoded(rule_id):
+def test_lifecycle_expiration_header_rule_id_url_encoded():
     # TODO: remove fails_on_rgw when RGW URL-encodes the rule-id of x-amz-expiration:
     # https://github.com/jhoblitt/rgw-go/blob/main/docs/ceph-upstream-bugs.md#radosgws-lifecycle-headers-depart-from-s3s-response-model
-    bucket_name = get_new_bucket()
-    client = get_client()
-    rules = [{'ID': rule_id, 'Expiration': {'Days': 1}, 'Prefix': 'days1/',
-              'Status': 'Enabled'}]
-    response = client.put_bucket_lifecycle_configuration(
-        Bucket=bucket_name, LifecycleConfiguration={'Rules': rules})
-    assert response['ResponseMetadata']['HTTPStatusCode'] == 200
+    for rule_id in ('expire old, "logs"=1',
+                    'x", expiry-date="Fri, 01 Jan 2100 00:00:00 GMT'):
+        bucket_name = get_new_bucket()
+        client = get_client()
+        rules = [{'ID': rule_id, 'Expiration': {'Days': 1}, 'Prefix': 'days1/',
+                  'Status': 'Enabled'}]
+        response = client.put_bucket_lifecycle_configuration(
+            Bucket=bucket_name, LifecycleConfiguration={'Rules': rules})
+        assert response['ResponseMetadata']['HTTPStatusCode'] == 200
 
-    put_response = client.put_object(Bucket=bucket_name, Key='days1/foo', Body='bar')
-    head_response = client.head_object(Bucket=bucket_name, Key='days1/foo')
+        put_response = client.put_object(Bucket=bucket_name, Key='days1/foo', Body='bar')
+        head_response = client.head_object(Bucket=bucket_name, Key='days1/foo')
 
-    # the header is expiry-date="<date>", rule-id="<rule-id>" with the rule-id
-    # URL-encoded, so no byte of the ID ends its quoted value or starts another
-    # pair, and unquote_plus reads the ID back whether a space is %20 or +
-    for response in (put_response, head_response):
-        header = response['ResponseMetadata']['HTTPHeaders']['x-amz-expiration']
-        m = re.fullmatch(r'expiry-date="([^"]*)", rule-id="([^"]*)"', header)
-        assert m, header
-        assert header.count('expiry-date=') == 1
-        assert ' ' not in m.group(2) and ',' not in m.group(2)
-        assert unquote_plus(m.group(2)) == rule_id
+        # the header is expiry-date="<date>", rule-id="<rule-id>" with the rule-id
+        # URL-encoded, so no byte of the ID ends its quoted value or starts another
+        # pair, and unquote_plus reads the ID back whether a space is %20 or +
+        for response in (put_response, head_response):
+            header = response['ResponseMetadata']['HTTPHeaders']['x-amz-expiration']
+            m = re.fullmatch(r'expiry-date="([^"]*)", rule-id="([^"]*)"', header)
+            assert m, header
+            assert header.count('expiry-date=') == 1
+            assert ' ' not in m.group(2) and ',' not in m.group(2)
+            assert unquote_plus(m.group(2)) == rule_id
 
 @pytest.mark.lifecycle
 def test_lifecycle_set_noncurrent():
