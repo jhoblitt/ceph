@@ -11234,6 +11234,49 @@ def test_lifecycle_expiration_header_rule_id_url_encoded():
             assert unquote_plus(m.group(2)) == rule_id
 
 @pytest.mark.lifecycle
+@pytest.mark.fails_on_rgw
+def test_lifecycle_expiration_header_copy_object():
+    bucket_name = get_new_bucket()
+    client = get_client()
+
+    now = datetime.datetime.utcnow()
+    setup_lifecycle_expiration(
+        client, bucket_name, 'rule1', 1, 'days1/')
+
+    response = client.copy_object(Bucket=bucket_name, Key='days1/copy',
+                                  CopySource={'Bucket': bucket_name, 'Key': 'days1/foo'})
+    assert response['ResponseMetadata']['HTTPStatusCode'] == 200
+    assert check_lifecycle_expiration_header(response, now, 'rule1', 1)
+
+    response = client.copy_object(Bucket=bucket_name, Key='other/copy',
+                                  CopySource={'Bucket': bucket_name, 'Key': 'days1/foo'})
+    assert response['ResponseMetadata']['HTTPStatusCode'] == 200
+    assert 'x-amz-expiration' not in response['ResponseMetadata']['HTTPHeaders']
+
+@pytest.mark.lifecycle
+@pytest.mark.fails_on_rgw
+def test_lifecycle_expiration_header_complete_multipart_upload():
+    bucket_name = get_new_bucket()
+    client = get_client()
+
+    now = datetime.datetime.utcnow()
+    setup_lifecycle_expiration(
+        client, bucket_name, 'rule1', 1, 'days1/')
+
+    for key, covered in [('days1/mp', True), ('other/mp', False)]:
+        upload_id = client.create_multipart_upload(Bucket=bucket_name, Key=key)['UploadId']
+        part = client.upload_part(Bucket=bucket_name, Key=key, UploadId=upload_id,
+                                  PartNumber=1, Body='bar')
+        response = client.complete_multipart_upload(
+            Bucket=bucket_name, Key=key, UploadId=upload_id,
+            MultipartUpload={'Parts': [{'ETag': part['ETag'], 'PartNumber': 1}]})
+        assert response['ResponseMetadata']['HTTPStatusCode'] == 200
+        if covered:
+            assert check_lifecycle_expiration_header(response, now, 'rule1', 1)
+        else:
+            assert 'x-amz-expiration' not in response['ResponseMetadata']['HTTPHeaders']
+
+@pytest.mark.lifecycle
 def test_lifecycle_set_noncurrent():
     bucket_name = _create_objects(keys=['past/foo', 'future/bar'])
     client = get_client()
@@ -11443,6 +11486,31 @@ def test_lifecycle_multipart_abort_date_header():
     assert response['AbortDate'] <= now + datetime.timedelta(days=3)
 
     response = client.create_multipart_upload(Bucket=bucket_name, Key='test2/a')
+    assert 'AbortDate' not in response
+    assert 'AbortRuleId' not in response
+
+@pytest.mark.lifecycle
+@pytest.mark.fails_on_rgw
+def test_lifecycle_multipart_abort_date_header_list_parts():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    rules = [
+        {'ID': 'rule1', 'Prefix': 'test1/', 'Status': 'Enabled',
+         'AbortIncompleteMultipartUpload': {'DaysAfterInitiation': 2}},
+    ]
+    lifecycle = {'Rules': rules}
+    client.put_bucket_lifecycle_configuration(Bucket=bucket_name, LifecycleConfiguration=lifecycle)
+
+    now = datetime.datetime.now(pytz.utc).replace(microsecond=0)
+    upload_id = client.create_multipart_upload(Bucket=bucket_name, Key='test1/a')['UploadId']
+    client.upload_part(Bucket=bucket_name, Key='test1/a', UploadId=upload_id, PartNumber=1, Body='bar')
+    response = client.list_parts(Bucket=bucket_name, Key='test1/a', UploadId=upload_id)
+    assert response['AbortRuleId'] == 'rule1'
+    assert response['AbortDate'] >= now + datetime.timedelta(days=2)
+    assert response['AbortDate'] <= now + datetime.timedelta(days=3)
+
+    upload_id = client.create_multipart_upload(Bucket=bucket_name, Key='test2/a')['UploadId']
+    response = client.list_parts(Bucket=bucket_name, Key='test2/a', UploadId=upload_id)
     assert 'AbortDate' not in response
     assert 'AbortRuleId' not in response
 
