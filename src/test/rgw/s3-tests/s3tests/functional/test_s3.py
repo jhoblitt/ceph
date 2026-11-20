@@ -25627,3 +25627,391 @@ def test_bucket_policy_deny_stringnotlike_key_other_case():
     status, error_code = _get_status_and_error_code(e.response)
     assert status == 403
     assert error_code == 'AccessDenied'
+
+
+@pytest.mark.bucket_policy
+@pytest.mark.fails_on_rgw
+def test_bucket_policy_deny_put_obj_acl_copy_and_multipart():
+    # A Deny of s3:PutObject conditioned on s3:x-amz-acl refuses each write
+    # whose x-amz-acl it names. RGW adds the key to PutObject's check alone,
+    # and serves the CopyObject and the CreateMultipartUpload.
+    def _put_object_condition_bucket(statements):
+        # A bucket holding 'source', whose policy lets the alt user read its
+        # objects and holds statements, each a function of the alt user's
+        # principal and the bucket's objects' ARN.
+        bucket_name = get_new_bucket()
+        client = get_client()
+        client.put_object(Bucket=bucket_name, Key='source', Body='asdf')
+        alt_principal = {"AWS": "arn:aws:iam:::user/{}".format(get_alt_user_id())}
+        resource = "arn:aws:s3:::" + bucket_name + "/*"
+        policy_document = json.dumps(
+        {
+            "Version": "2012-10-17",
+            "Statement": [{"Effect": "Allow", "Principal": alt_principal, "Resource": resource, "Action": "s3:GetObject"}] +
+                         [s(alt_principal, resource) for s in statements]
+        })
+        client.put_bucket_policy(Bucket=bucket_name, Policy=policy_document)
+        return bucket_name, client
+    def _put_copy_and_upload(client, alt_client, bucket_name):
+        # The three writes that take an ACL and tags, by the alt user, each
+        # setting the same, from the bucket's object 'source': served() checks
+        # each succeeds, refused() that each is 403 AccessDenied and writes
+        # nothing. A copy that sets tags replaces its source's metadata and tags,
+        # the directives under which RGW and S3 take its tag header.
+        copy_source = {'Bucket': bucket_name, 'Key': 'source'}
+
+        def writes(**setting):
+            copy_setting = dict(setting)
+            if 'Tagging' in setting:
+                copy_setting.update(MetadataDirective='REPLACE', TaggingDirective='REPLACE')
+            return {
+                'put_object': lambda key: alt_client.put_object(Bucket=bucket_name, Key=key, Body='asdf', **setting),
+                'copy_object': lambda key: alt_client.copy_object(Bucket=bucket_name, Key=key, CopySource=copy_source, **copy_setting),
+                'create_multipart_upload': lambda key: alt_client.create_multipart_upload(Bucket=bucket_name, Key=key, **setting),
+            }
+
+        def served(**setting):
+            for name, write in writes(**setting).items():
+                key = 'served-' + name
+                response = write(key)
+                if name == 'create_multipart_upload':
+                    client.abort_multipart_upload(Bucket=bucket_name, Key=key, UploadId=response['UploadId'])
+                else:
+                    alt_client.head_object(Bucket=bucket_name, Key=key)
+
+        def refused(**setting):
+            for name, write in writes(**setting).items():
+                key = 'refused-' + name
+                e = assert_raises(ClientError, write, key)
+                status, error_code = _get_status_and_error_code(e.response)
+                assert status == 403, name
+                assert error_code == 'AccessDenied', name
+                e = assert_raises(ClientError, client.head_object, Bucket=bucket_name, Key=key)
+                status, error_code = _get_status_and_error_code(e.response)
+                assert status == 404, name
+            assert 'Uploads' not in client.list_multipart_uploads(Bucket=bucket_name)
+
+        return served, refused
+    bucket_name, client = _put_object_condition_bucket([
+        lambda principal, resource: {"Effect": "Allow", "Principal": principal, "Resource": resource,
+                                     "Action": ["s3:PutObject", "s3:PutObjectAcl"]},
+        lambda principal, resource: {"Effect": "Deny", "Principal": principal, "Resource": resource,
+                                     "Action": "s3:PutObject",
+                                     "Condition": {"StringEquals": {"s3:x-amz-acl": "public-read"}}},
+    ])
+    served, refused = _put_copy_and_upload(client, get_alt_client(), bucket_name)
+    served()
+    served(ACL='authenticated-read')
+    refused(ACL='public-read')
+
+@pytest.mark.bucket_policy
+@pytest.mark.fails_on_rgw
+def test_bucket_policy_put_obj_bucket_owner_full_control_copy_and_multipart():
+    # An Allow of s3:PutObject conditioned on x-amz-acl bucket-owner-full-control
+    # serves each write that names it, and no other. RGW adds the key to
+    # PutObject's check alone, and refuses the CopyObject and the
+    # CreateMultipartUpload that name it.
+    def _put_object_condition_bucket(statements):
+        # A bucket holding 'source', whose policy lets the alt user read its
+        # objects and holds statements, each a function of the alt user's
+        # principal and the bucket's objects' ARN.
+        bucket_name = get_new_bucket()
+        client = get_client()
+        client.put_object(Bucket=bucket_name, Key='source', Body='asdf')
+        alt_principal = {"AWS": "arn:aws:iam:::user/{}".format(get_alt_user_id())}
+        resource = "arn:aws:s3:::" + bucket_name + "/*"
+        policy_document = json.dumps(
+        {
+            "Version": "2012-10-17",
+            "Statement": [{"Effect": "Allow", "Principal": alt_principal, "Resource": resource, "Action": "s3:GetObject"}] +
+                         [s(alt_principal, resource) for s in statements]
+        })
+        client.put_bucket_policy(Bucket=bucket_name, Policy=policy_document)
+        return bucket_name, client
+    def _put_copy_and_upload(client, alt_client, bucket_name):
+        # The three writes that take an ACL and tags, by the alt user, each
+        # setting the same, from the bucket's object 'source': served() checks
+        # each succeeds, refused() that each is 403 AccessDenied and writes
+        # nothing. A copy that sets tags replaces its source's metadata and tags,
+        # the directives under which RGW and S3 take its tag header.
+        copy_source = {'Bucket': bucket_name, 'Key': 'source'}
+
+        def writes(**setting):
+            copy_setting = dict(setting)
+            if 'Tagging' in setting:
+                copy_setting.update(MetadataDirective='REPLACE', TaggingDirective='REPLACE')
+            return {
+                'put_object': lambda key: alt_client.put_object(Bucket=bucket_name, Key=key, Body='asdf', **setting),
+                'copy_object': lambda key: alt_client.copy_object(Bucket=bucket_name, Key=key, CopySource=copy_source, **copy_setting),
+                'create_multipart_upload': lambda key: alt_client.create_multipart_upload(Bucket=bucket_name, Key=key, **setting),
+            }
+
+        def served(**setting):
+            for name, write in writes(**setting).items():
+                key = 'served-' + name
+                response = write(key)
+                if name == 'create_multipart_upload':
+                    client.abort_multipart_upload(Bucket=bucket_name, Key=key, UploadId=response['UploadId'])
+                else:
+                    alt_client.head_object(Bucket=bucket_name, Key=key)
+
+        def refused(**setting):
+            for name, write in writes(**setting).items():
+                key = 'refused-' + name
+                e = assert_raises(ClientError, write, key)
+                status, error_code = _get_status_and_error_code(e.response)
+                assert status == 403, name
+                assert error_code == 'AccessDenied', name
+                e = assert_raises(ClientError, client.head_object, Bucket=bucket_name, Key=key)
+                status, error_code = _get_status_and_error_code(e.response)
+                assert status == 404, name
+            assert 'Uploads' not in client.list_multipart_uploads(Bucket=bucket_name)
+
+        return served, refused
+    bucket_name, client = _put_object_condition_bucket([
+        lambda principal, resource: {"Effect": "Allow", "Principal": principal, "Resource": resource,
+                                     "Action": "s3:PutObject",
+                                     "Condition": {"StringEquals": {"s3:x-amz-acl": "bucket-owner-full-control"}}},
+    ])
+    served, refused = _put_copy_and_upload(client, get_alt_client(), bucket_name)
+    served(ACL='bucket-owner-full-control')
+    refused()
+    refused(ACL='public-read')
+
+@pytest.mark.tagging
+@pytest.mark.bucket_policy
+@pytest.mark.fails_on_rgw
+def test_bucket_policy_deny_put_obj_request_tag_copy_and_multipart():
+    # A Deny of s3:PutObject conditioned on s3:RequestObjectTag refuses each
+    # write that sets the tag it names. RGW adds the key to PutObject's check
+    # alone, and serves the CopyObject and the CreateMultipartUpload.
+    def _put_object_condition_bucket(statements):
+        # A bucket holding 'source', whose policy lets the alt user read its
+        # objects and holds statements, each a function of the alt user's
+        # principal and the bucket's objects' ARN.
+        bucket_name = get_new_bucket()
+        client = get_client()
+        client.put_object(Bucket=bucket_name, Key='source', Body='asdf')
+        alt_principal = {"AWS": "arn:aws:iam:::user/{}".format(get_alt_user_id())}
+        resource = "arn:aws:s3:::" + bucket_name + "/*"
+        policy_document = json.dumps(
+        {
+            "Version": "2012-10-17",
+            "Statement": [{"Effect": "Allow", "Principal": alt_principal, "Resource": resource, "Action": "s3:GetObject"}] +
+                         [s(alt_principal, resource) for s in statements]
+        })
+        client.put_bucket_policy(Bucket=bucket_name, Policy=policy_document)
+        return bucket_name, client
+    def _put_copy_and_upload(client, alt_client, bucket_name):
+        # The three writes that take an ACL and tags, by the alt user, each
+        # setting the same, from the bucket's object 'source': served() checks
+        # each succeeds, refused() that each is 403 AccessDenied and writes
+        # nothing. A copy that sets tags replaces its source's metadata and tags,
+        # the directives under which RGW and S3 take its tag header.
+        copy_source = {'Bucket': bucket_name, 'Key': 'source'}
+
+        def writes(**setting):
+            copy_setting = dict(setting)
+            if 'Tagging' in setting:
+                copy_setting.update(MetadataDirective='REPLACE', TaggingDirective='REPLACE')
+            return {
+                'put_object': lambda key: alt_client.put_object(Bucket=bucket_name, Key=key, Body='asdf', **setting),
+                'copy_object': lambda key: alt_client.copy_object(Bucket=bucket_name, Key=key, CopySource=copy_source, **copy_setting),
+                'create_multipart_upload': lambda key: alt_client.create_multipart_upload(Bucket=bucket_name, Key=key, **setting),
+            }
+
+        def served(**setting):
+            for name, write in writes(**setting).items():
+                key = 'served-' + name
+                response = write(key)
+                if name == 'create_multipart_upload':
+                    client.abort_multipart_upload(Bucket=bucket_name, Key=key, UploadId=response['UploadId'])
+                else:
+                    alt_client.head_object(Bucket=bucket_name, Key=key)
+
+        def refused(**setting):
+            for name, write in writes(**setting).items():
+                key = 'refused-' + name
+                e = assert_raises(ClientError, write, key)
+                status, error_code = _get_status_and_error_code(e.response)
+                assert status == 403, name
+                assert error_code == 'AccessDenied', name
+                e = assert_raises(ClientError, client.head_object, Bucket=bucket_name, Key=key)
+                status, error_code = _get_status_and_error_code(e.response)
+                assert status == 404, name
+            assert 'Uploads' not in client.list_multipart_uploads(Bucket=bucket_name)
+
+        return served, refused
+    bucket_name, client = _put_object_condition_bucket([
+        lambda principal, resource: {"Effect": "Allow", "Principal": principal, "Resource": resource,
+                                     "Action": ["s3:PutObject", "s3:PutObjectTagging"]},
+        lambda principal, resource: {"Effect": "Deny", "Principal": principal, "Resource": resource,
+                                     "Action": "s3:PutObject",
+                                     "Condition": {"StringEquals": {"s3:RequestObjectTag/classified": "yes"}}},
+    ])
+    served, refused = _put_copy_and_upload(client, get_alt_client(), bucket_name)
+    served(Tagging='other=1')
+    refused(Tagging='classified=yes')
+    refused(Tagging='other=1&classified=yes')
+
+@pytest.mark.tagging
+@pytest.mark.fails_on_rgw
+def test_copy_object_replace_tagging_too_many_tags():
+    # A copy that replaces its source's metadata and tags with more tags than
+    # an object may hold is refused, as a PutObject with them is. RGW parses
+    # no tag header for a copy, and stores it as sent.
+    bucket_name = get_new_bucket()
+    client = get_client()
+    client.put_object(Bucket=bucket_name, Key='source', Body='asdf')
+    tagging = '&'.join('k{}=v'.format(i) for i in range(11))
+    e = assert_raises(ClientError, client.put_object, Bucket=bucket_name, Key='put', Body='asdf', Tagging=tagging)
+    status, _ = _get_status_and_error_code(e.response)
+    assert status == 400
+    e = assert_raises(ClientError, client.copy_object, Bucket=bucket_name, Key='copy',
+                      CopySource={'Bucket': bucket_name, 'Key': 'source'},
+                      MetadataDirective='REPLACE', TaggingDirective='REPLACE', Tagging=tagging)
+    status, _ = _get_status_and_error_code(e.response)
+    assert status == 400
+    e = assert_raises(ClientError, client.head_object, Bucket=bucket_name, Key='copy')
+    status, _ = _get_status_and_error_code(e.response)
+    assert status == 404
+
+@pytest.mark.bucket_policy
+@pytest.mark.fails_on_rgw
+def test_bucket_policy_deny_put_obj_not_bucket_owner_full_control_copy_and_multipart():
+    # A Deny of s3:PutObject unless x-amz-acl is bucket-owner-full-control
+    # refuses each write that names another canned ACL or none. RGW adds the
+    # key to PutObject's check alone, and serves the CopyObject and the
+    # CreateMultipartUpload whatever their header.
+    def _put_object_condition_bucket(statements):
+        # A bucket holding 'source', whose policy lets the alt user read its
+        # objects and holds statements, each a function of the alt user's
+        # principal and the bucket's objects' ARN.
+        bucket_name = get_new_bucket()
+        client = get_client()
+        client.put_object(Bucket=bucket_name, Key='source', Body='asdf')
+        alt_principal = {"AWS": "arn:aws:iam:::user/{}".format(get_alt_user_id())}
+        resource = "arn:aws:s3:::" + bucket_name + "/*"
+        policy_document = json.dumps(
+        {
+            "Version": "2012-10-17",
+            "Statement": [{"Effect": "Allow", "Principal": alt_principal, "Resource": resource, "Action": "s3:GetObject"}] +
+                         [s(alt_principal, resource) for s in statements]
+        })
+        client.put_bucket_policy(Bucket=bucket_name, Policy=policy_document)
+        return bucket_name, client
+    def _put_copy_and_upload(client, alt_client, bucket_name):
+        # The three writes that take an ACL and tags, by the alt user, each
+        # setting the same, from the bucket's object 'source': served() checks
+        # each succeeds, refused() that each is 403 AccessDenied and writes
+        # nothing. A copy that sets tags replaces its source's metadata and tags,
+        # the directives under which RGW and S3 take its tag header.
+        copy_source = {'Bucket': bucket_name, 'Key': 'source'}
+
+        def writes(**setting):
+            copy_setting = dict(setting)
+            if 'Tagging' in setting:
+                copy_setting.update(MetadataDirective='REPLACE', TaggingDirective='REPLACE')
+            return {
+                'put_object': lambda key: alt_client.put_object(Bucket=bucket_name, Key=key, Body='asdf', **setting),
+                'copy_object': lambda key: alt_client.copy_object(Bucket=bucket_name, Key=key, CopySource=copy_source, **copy_setting),
+                'create_multipart_upload': lambda key: alt_client.create_multipart_upload(Bucket=bucket_name, Key=key, **setting),
+            }
+
+        def served(**setting):
+            for name, write in writes(**setting).items():
+                key = 'served-' + name
+                response = write(key)
+                if name == 'create_multipart_upload':
+                    client.abort_multipart_upload(Bucket=bucket_name, Key=key, UploadId=response['UploadId'])
+                else:
+                    alt_client.head_object(Bucket=bucket_name, Key=key)
+
+        def refused(**setting):
+            for name, write in writes(**setting).items():
+                key = 'refused-' + name
+                e = assert_raises(ClientError, write, key)
+                status, error_code = _get_status_and_error_code(e.response)
+                assert status == 403, name
+                assert error_code == 'AccessDenied', name
+                e = assert_raises(ClientError, client.head_object, Bucket=bucket_name, Key=key)
+                status, error_code = _get_status_and_error_code(e.response)
+                assert status == 404, name
+            assert 'Uploads' not in client.list_multipart_uploads(Bucket=bucket_name)
+
+        return served, refused
+    bucket_name, client = _put_object_condition_bucket([
+        lambda principal, resource: {"Effect": "Allow", "Principal": principal, "Resource": resource,
+                                     "Action": ["s3:PutObject", "s3:PutObjectAcl"]},
+        lambda principal, resource: {"Effect": "Deny", "Principal": principal, "Resource": resource,
+                                     "Action": "s3:PutObject",
+                                     "Condition": {"StringNotEquals": {"s3:x-amz-acl": "bucket-owner-full-control"}}},
+    ])
+    served, refused = _put_copy_and_upload(client, get_alt_client(), bucket_name)
+    served(ACL='bucket-owner-full-control')
+    refused()
+    refused(ACL='public-read')
+
+@pytest.mark.tagging
+@pytest.mark.fails_on_rgw
+def test_copy_object_replace_tagging_control_character():
+    # A copy that replaces its source's metadata and tags with a tag value
+    # holding a tab is refused. RGW stores such a header quoted-printable, as
+    # text that decodes to no tags. The copy is signed with SigV2, which signs
+    # the value with its tab, where SigV4's canonical headers collapse it.
+    bucket_name = get_new_bucket()
+    client = get_v2_client()
+    client.put_object(Bucket=bucket_name, Key='source', Body='asdf')
+    e = assert_raises(ClientError, client.copy_object, Bucket=bucket_name, Key='copy',
+                      CopySource={'Bucket': bucket_name, 'Key': 'source'},
+                      MetadataDirective='REPLACE', TaggingDirective='REPLACE', Tagging='project=a&z=1\t2')
+    status, _ = _get_status_and_error_code(e.response)
+    assert status == 400
+    e = assert_raises(ClientError, client.head_object, Bucket=bucket_name, Key='copy')
+    status, _ = _get_status_and_error_code(e.response)
+    assert status == 404
+
+@pytest.mark.bucket_policy
+@pytest.mark.fails_on_rgw
+def test_bucket_policy_deny_put_obj_null_acl():
+    # A Deny of s3:PutObject conditioned on s3:x-amz-acl being absent refuses
+    # a PutObject that sends no x-amz-acl, and serves one that names a canned
+    # ACL. RGW adds the key, empty, to the check of a PutObject that sends
+    # none, so the Deny never holds.
+    bucket_name = get_new_bucket()
+    client = get_client()
+    resource = _make_arn_resource("{}/{}".format(bucket_name, "*"))
+    deny = Statement("s3:PutObject", resource, effect="Deny", condition={"Null": {"s3:x-amz-acl": "true"}})
+    client.put_bucket_policy(Bucket=bucket_name, Policy=Policy().add_statement(deny).to_json())
+
+    e = assert_raises(ClientError, client.put_object, Bucket=bucket_name, Key='foo', Body='bar')
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 403
+    assert error_code == 'AccessDenied'
+    e = assert_raises(ClientError, client.head_object, Bucket=bucket_name, Key='foo')
+    status, _ = _get_status_and_error_code(e.response)
+    assert status == 404
+    client.put_object(Bucket=bucket_name, Key='foo', Body='bar', ACL='private')
+
+@pytest.mark.bucket_policy
+@pytest.mark.fails_on_rgw
+def test_bucket_policy_deny_put_obj_acl_body_null_acl():
+    # The same Deny, of s3:PutObjectAcl too, refuses a PutObjectAcl that sets
+    # the ACL by its body, which sends no x-amz-acl, and serves one that names
+    # a canned ACL. RGW adds the key, empty, to the check of a PutObjectAcl
+    # that sends none, so the Deny never holds.
+    bucket_name = get_new_bucket()
+    client = get_client()
+    client.put_object(Bucket=bucket_name, Key='foo', Body='bar')
+    response = client.get_object_acl(Bucket=bucket_name, Key='foo')
+    acl = {'Owner': response['Owner'], 'Grants': response['Grants']}
+    resource = _make_arn_resource("{}/{}".format(bucket_name, "*"))
+    deny = Statement(["s3:PutObject", "s3:PutObjectAcl"], resource, effect="Deny",
+                     condition={"Null": {"s3:x-amz-acl": "true"}})
+    client.put_bucket_policy(Bucket=bucket_name, Policy=Policy().add_statement(deny).to_json())
+
+    e = assert_raises(ClientError, client.put_object_acl, Bucket=bucket_name, Key='foo', AccessControlPolicy=acl)
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 403
+    assert error_code == 'AccessDenied'
+    client.put_object_acl(Bucket=bucket_name, Key='foo', ACL='private')
