@@ -25538,3 +25538,92 @@ def test_website_object_redirect_location():
         assert body == b'<p>index</p>'
     finally:
         conn.close()
+
+
+@pytest.mark.bucket_policy
+@pytest.mark.fails_on_rgw
+def test_bucket_policy_deny_stringlike_key_other_case():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    client.put_object(Bucket=bucket_name, Key='public/foo', Body='foo')
+    alt_principal = {"AWS": "arn:aws:iam:::user/{}".format(get_alt_user_id())}
+    policy_document = json.dumps(
+    {
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": alt_principal,
+            "Action": "s3:ListBucket",
+            "Resource": "arn:aws:s3:::{}".format(bucket_name)
+        }, {
+            "Effect": "Deny",
+            "Principal": alt_principal,
+            "Action": "s3:ListBucket",
+            "Resource": "arn:aws:s3:::{}".format(bucket_name),
+            "Condition": {
+                "StringLike": {
+                    "S3:Prefix": ["private/*", "home/[a]/*", "zz?"]
+                }
+            }
+        }]
+    })
+    client.put_bucket_policy(Bucket=bucket_name, Policy=policy_document)
+
+    alt_client = get_alt_client()
+    e = assert_raises(ClientError, alt_client.list_objects, Bucket=bucket_name, Prefix='private/')
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 403
+    assert error_code == 'AccessDenied'
+
+    # a pattern's brackets are literal characters, beside a pattern with a ?
+    # and under a prefix that ends in a character outside the BMP
+    e = assert_raises(ClientError, alt_client.list_objects, Bucket=bucket_name, Prefix='home/[a]/\U0001F600')
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 403
+    assert error_code == 'AccessDenied'
+
+    response = alt_client.list_objects(Bucket=bucket_name, Prefix='public/')
+    assert [o['Key'] for o in response['Contents']] == ['public/foo']
+
+@pytest.mark.bucket_policy
+@pytest.mark.fails_on_rgw
+def test_bucket_policy_deny_stringnotlike_key_other_case():
+    bucket_name = get_new_bucket()
+    client = get_client()
+    client.put_object(Bucket=bucket_name, Key='home/foo', Body='foo')
+    alt_principal = {"AWS": "arn:aws:iam:::user/{}".format(get_alt_user_id())}
+    policy_document = json.dumps(
+    {
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": alt_principal,
+            "Action": "s3:ListBucket",
+            "Resource": "arn:aws:s3:::{}".format(bucket_name)
+        }, {
+            "Effect": "Deny",
+            "Principal": alt_principal,
+            "Action": "s3:ListBucket",
+            "Resource": "arn:aws:s3:::{}".format(bucket_name),
+            "Condition": {
+                "StringNotLike": {
+                    "S3:Prefix": ["home/*", "zz?"]
+                }
+            }
+        }]
+    })
+    client.put_bucket_policy(Bucket=bucket_name, Policy=policy_document)
+
+    alt_client = get_alt_client()
+    response = alt_client.list_objects(Bucket=bucket_name, Prefix='home/')
+    assert [o['Key'] for o in response['Contents']] == ['home/foo']
+
+    # home/* matches a prefix that ends in a character outside the BMP,
+    # beside a pattern with a ?
+    response = alt_client.list_objects(Bucket=bucket_name, Prefix='home/\U0001F600')
+    assert response['ResponseMetadata']['HTTPStatusCode'] == 200
+
+    e = assert_raises(ClientError, alt_client.list_objects, Bucket=bucket_name, Prefix='other/')
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 403
+    assert error_code == 'AccessDenied'
