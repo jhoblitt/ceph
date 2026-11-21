@@ -26015,3 +26015,321 @@ def test_bucket_policy_deny_put_obj_acl_body_null_acl():
     assert status == 403
     assert error_code == 'AccessDenied'
     client.put_object_acl(Bucket=bucket_name, Key='foo', ACL='private')
+
+
+@pytest.mark.bucket_policy
+@pytest.mark.fails_on_rgw
+def test_bucket_policy_deny_secure_transport_false():
+    # S3's request context holds aws:SecureTransport for every request, false
+    # for one not sent over TLS. RGW adds the key only for one sent over TLS,
+    # so a Deny on false applies to no request.
+    def _deny_get_object_bucket():
+        # A bucket holding 'foo', and a function that replaces its policy with one
+        # Deny of s3:GetObject on its objects under condition.
+        bucket_name = get_new_bucket()
+        client = get_client()
+        client.put_object(Bucket=bucket_name, Key='foo', Body='foo')
+
+        def deny_get(condition):
+            client.put_bucket_policy(Bucket=bucket_name, Policy=json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Deny",
+                    "Principal": "*",
+                    "Action": "s3:GetObject",
+                    "Resource": "arn:aws:s3:::{}/*".format(bucket_name),
+                    "Condition": condition
+                }]
+            }))
+        return bucket_name, client, deny_get
+    def _check_get_refused(client, bucket_name):
+        e = assert_raises(ClientError, client.get_object, Bucket=bucket_name, Key='foo')
+        status, error_code = _get_status_and_error_code(e.response)
+        assert status == 403
+        assert error_code == 'AccessDenied'
+    if get_config_is_secure():
+        pytest.skip('the suite runs over TLS, where a Deny on false applies to no request on either gateway')
+    bucket_name, client, deny_get = _deny_get_object_bucket()
+    deny_get({"Bool": {"aws:SecureTransport": "false"}})
+    _check_get_refused(client, bucket_name)
+
+@pytest.mark.bucket_policy
+@pytest.mark.fails_on_rgw
+def test_bucket_policy_deny_request_time_amazon_forms():
+    # S3 sets aws:EpochTime to the request's time in seconds, which the
+    # numeric operators compare, and aws:CurrentTime to its date and time.
+    # RGW sets the two the other way round, so neither Deny below applies.
+    def _deny_get_object_bucket():
+        # A bucket holding 'foo', and a function that replaces its policy with one
+        # Deny of s3:GetObject on its objects under condition.
+        bucket_name = get_new_bucket()
+        client = get_client()
+        client.put_object(Bucket=bucket_name, Key='foo', Body='foo')
+
+        def deny_get(condition):
+            client.put_bucket_policy(Bucket=bucket_name, Policy=json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Deny",
+                    "Principal": "*",
+                    "Action": "s3:GetObject",
+                    "Resource": "arn:aws:s3:::{}/*".format(bucket_name),
+                    "Condition": condition
+                }]
+            }))
+        return bucket_name, client, deny_get
+    def _check_get_refused(client, bucket_name):
+        e = assert_raises(ClientError, client.get_object, Bucket=bucket_name, Key='foo')
+        status, error_code = _get_status_and_error_code(e.response)
+        assert status == 403
+        assert error_code == 'AccessDenied'
+    bucket_name, client, deny_get = _deny_get_object_bucket()
+    deny_get({"NumericGreaterThan": {"aws:EpochTime": "1000000000"}})
+    _check_get_refused(client, bucket_name)
+    deny_get({"NumericLessThan": {"aws:EpochTime": "1000000000"}})
+    assert _get_body(client.get_object(Bucket=bucket_name, Key='foo')) == 'foo'
+    deny_get({"StringLike": {"aws:CurrentTime": "*-*-*T*"}})
+    _check_get_refused(client, bucket_name)
+
+@pytest.mark.bucket_policy
+@pytest.mark.fails_on_rgw
+def test_bucket_policy_deny_signature_version():
+    # S3 sets s3:signatureversion to AWS for a request signed by Signature
+    # Version 2 and to AWS4-HMAC-SHA256 for one signed by Signature Version 4.
+    # RGW sets no such key, so it serves a SigV2 request under either Deny
+    # below.
+    def _deny_get_object_bucket():
+        # A bucket holding 'foo', and a function that replaces its policy with one
+        # Deny of s3:GetObject on its objects under condition.
+        bucket_name = get_new_bucket()
+        client = get_client()
+        client.put_object(Bucket=bucket_name, Key='foo', Body='foo')
+
+        def deny_get(condition):
+            client.put_bucket_policy(Bucket=bucket_name, Policy=json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Deny",
+                    "Principal": "*",
+                    "Action": "s3:GetObject",
+                    "Resource": "arn:aws:s3:::{}/*".format(bucket_name),
+                    "Condition": condition
+                }]
+            }))
+        return bucket_name, client, deny_get
+    def _check_get_refused(client, bucket_name):
+        e = assert_raises(ClientError, client.get_object, Bucket=bucket_name, Key='foo')
+        status, error_code = _get_status_and_error_code(e.response)
+        assert status == 403
+        assert error_code == 'AccessDenied'
+    def _presigned_get_status(client, bucket_name):
+        url = client.generate_presigned_url(ClientMethod='get_object', Params={'Bucket': bucket_name, 'Key': 'foo'},
+                                            ExpiresIn=100000, HttpMethod='GET')
+        return requests.get(url, verify=get_config_ssl_verify()).status_code
+    bucket_name, client, deny_get = _deny_get_object_bucket()
+    v2_client = get_v2_client()
+    deny_get({"StringEquals": {"s3:signatureversion": "AWS"}})
+    assert _get_body(client.get_object(Bucket=bucket_name, Key='foo')) == 'foo'
+    _check_get_refused(v2_client, bucket_name)
+    deny_get({"StringNotEquals": {"s3:signatureversion": "AWS4-HMAC-SHA256"}})
+    assert _get_body(client.get_object(Bucket=bucket_name, Key='foo')) == 'foo'
+    _check_get_refused(v2_client, bucket_name)
+    assert _presigned_get_status(client, bucket_name) == 200
+    assert _presigned_get_status(v2_client, bucket_name) == 403
+
+@pytest.mark.bucket_policy
+@pytest.mark.fails_on_rgw
+def test_bucket_policy_deny_auth_type():
+    # S3 sets s3:authType to REST-HEADER for a request signed in its
+    # Authorization header and to REST-QUERY-STRING for a presigned URL. RGW
+    # sets no such key, so it serves a presigned URL under either Deny below.
+    def _deny_get_object_bucket():
+        # A bucket holding 'foo', and a function that replaces its policy with one
+        # Deny of s3:GetObject on its objects under condition.
+        bucket_name = get_new_bucket()
+        client = get_client()
+        client.put_object(Bucket=bucket_name, Key='foo', Body='foo')
+
+        def deny_get(condition):
+            client.put_bucket_policy(Bucket=bucket_name, Policy=json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Deny",
+                    "Principal": "*",
+                    "Action": "s3:GetObject",
+                    "Resource": "arn:aws:s3:::{}/*".format(bucket_name),
+                    "Condition": condition
+                }]
+            }))
+        return bucket_name, client, deny_get
+    def _presigned_get_status(client, bucket_name):
+        url = client.generate_presigned_url(ClientMethod='get_object', Params={'Bucket': bucket_name, 'Key': 'foo'},
+                                            ExpiresIn=100000, HttpMethod='GET')
+        return requests.get(url, verify=get_config_ssl_verify()).status_code
+    bucket_name, client, deny_get = _deny_get_object_bucket()
+    deny_get({"StringNotEquals": {"s3:authType": "REST-HEADER"}})
+    assert _get_body(client.get_object(Bucket=bucket_name, Key='foo')) == 'foo'
+    assert _presigned_get_status(client, bucket_name) == 403
+    deny_get({"StringEquals": {"s3:authType": "REST-QUERY-STRING"}})
+    assert _get_body(client.get_object(Bucket=bucket_name, Key='foo')) == 'foo'
+    assert _presigned_get_status(client, bucket_name) == 403
+    assert _presigned_get_status(get_v2_client(), bucket_name) == 403
+    # A negated operator over two values holds only where the request's value
+    # is neither.
+    deny_get({"StringNotEquals": {"s3:authType": ["REST-HEADER", "REST-QUERY-STRING"]}})
+    assert _get_body(client.get_object(Bucket=bucket_name, Key='foo')) == 'foo'
+    assert _presigned_get_status(client, bucket_name) == 200
+
+@pytest.mark.bucket_policy
+@pytest.mark.fails_on_rgw
+def test_bucket_policy_deny_unsigned_payload():
+    # S3 sets s3:x-amz-content-sha256 to the payload hash a request signed by
+    # Signature Version 4 signs, UNSIGNED-PAYLOAD for a payload it does not
+    # sign, a presigned URL's among them. RGW sets no such key, so it serves an
+    # unsigned request under the first Deny below and a signed one under the
+    # second. The gateways take any hash that contains UNSIGNED-PAYLOAD, and the
+    # unsigned aws-chunked form, for a payload with no signature, and the Deny
+    # refuses each of them. Where S3's documentation leaves the value open, a
+    # Deny holds on either reading: a presigned URL's is UNSIGNED-PAYLOAD or
+    # absent, so the negated Deny refuses it too, and the unsigned aws-chunked
+    # form's is UNSIGNED-PAYLOAD or as sent, so the third Deny refuses it.
+    def _deny_get_object_bucket():
+        # A bucket holding 'foo', and a function that replaces its policy with one
+        # Deny of s3:GetObject on its objects under condition.
+        bucket_name = get_new_bucket()
+        client = get_client()
+        client.put_object(Bucket=bucket_name, Key='foo', Body='foo')
+
+        def deny_get(condition):
+            client.put_bucket_policy(Bucket=bucket_name, Policy=json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Deny",
+                    "Principal": "*",
+                    "Action": "s3:GetObject",
+                    "Resource": "arn:aws:s3:::{}/*".format(bucket_name),
+                    "Condition": condition
+                }]
+            }))
+        return bucket_name, client, deny_get
+    def _check_get_refused(client, bucket_name):
+        e = assert_raises(ClientError, client.get_object, Bucket=bucket_name, Key='foo')
+        status, error_code = _get_status_and_error_code(e.response)
+        assert status == 403
+        assert error_code == 'AccessDenied'
+    def _presigned_get_status(client, bucket_name):
+        url = client.generate_presigned_url(ClientMethod='get_object', Params={'Bucket': bucket_name, 'Key': 'foo'},
+                                            ExpiresIn=100000, HttpMethod='GET')
+        return requests.get(url, verify=get_config_ssl_verify()).status_code
+    bucket_name, client, deny_get = _deny_get_object_bucket()
+    unsigned_client = get_client(client_config=botocore.config.Config(
+        signature_version='s3v4', s3={'payload_signing_enabled': False}))
+
+    def get_with_payload_hash(payload_hash):
+        # A GET of 'foo' signed in its Authorization header with
+        # x-amz-content-sha256 set to payload_hash, which the signature covers.
+        url = '{}/{}/foo'.format(get_config_endpoint(), bucket_name)
+        request = AWSRequest(method='GET', url=url, headers={'X-Amz-Content-SHA256': payload_hash})
+        credentials = Credentials(get_main_aws_access_key(), get_main_aws_secret_key())
+        botocore.auth.SigV4Auth(credentials, 's3', client.meta.region_name or 'us-east-1').add_auth(request)
+        return requests.get(url, headers=dict(request.headers), verify=get_config_ssl_verify()).status_code
+
+    deny_get({"StringEquals": {"s3:x-amz-content-sha256": "UNSIGNED-PAYLOAD"}})
+    assert _get_body(client.get_object(Bucket=bucket_name, Key='foo')) == 'foo'
+    _check_get_refused(unsigned_client, bucket_name)
+    assert get_with_payload_hash('XUNSIGNED-PAYLOAD') == 403
+    assert get_with_payload_hash('UNSIGNED-PAYLOAD-X') == 403
+    assert get_with_payload_hash('STREAMING-UNSIGNED-PAYLOAD-TRAILER') == 403
+    assert _presigned_get_status(client, bucket_name) == 403
+    deny_get({"StringNotEquals": {"s3:x-amz-content-sha256": "UNSIGNED-PAYLOAD"}})
+    _check_get_refused(client, bucket_name)
+    assert _get_body(unsigned_client.get_object(Bucket=bucket_name, Key='foo')) == 'foo'
+    assert _presigned_get_status(client, bucket_name) == 403
+    deny_get({"StringEquals": {"s3:x-amz-content-sha256": "STREAMING-UNSIGNED-PAYLOAD-TRAILER"}})
+    assert get_with_payload_hash('STREAMING-UNSIGNED-PAYLOAD-TRAILER') == 403
+    assert _get_body(client.get_object(Bucket=bucket_name, Key='foo')) == 'foo'
+    assert _presigned_get_status(client, bucket_name) == 200
+
+@pytest.mark.bucket_policy
+@pytest.mark.fails_on_rgw
+def test_bucket_policy_deny_storage_class():
+    # S3 sets s3:x-amz-storage-class to the storage class an upload asks for.
+    # RGW sets no such key, so a Deny on a class applies to no upload.
+    bucket_name = get_new_bucket()
+    client = get_client()
+    client.put_bucket_policy(Bucket=bucket_name, Policy=json.dumps(
+    {
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "s3:PutObject",
+            "Resource": "arn:aws:s3:::{}/*".format(bucket_name),
+            "Condition": {"StringEquals": {"s3:x-amz-storage-class": "STANDARD"}}
+        }]
+    }))
+    e = assert_raises(ClientError, client.put_object, Bucket=bucket_name, Key='foo', Body='foo', StorageClass='STANDARD')
+    status, error_code = _get_status_and_error_code(e.response)
+    assert status == 403
+    assert error_code == 'AccessDenied'
+    e = assert_raises(ClientError, client.head_object, Bucket=bucket_name, Key='foo')
+    assert _get_status(e.response) == 404
+    client.put_object(Bucket=bucket_name, Key='bar', Body='bar')
+    client.head_object(Bucket=bucket_name, Key='bar')
+
+@pytest.mark.bucket_policy
+@pytest.mark.fails_on_rgw
+def test_bucket_policy_deny_version_id():
+    # S3 sets s3:VersionId to the version a check is on: the one a request
+    # names, a copy's source names, or a DeleteObjects key names. RGW sets no
+    # such key, so a Deny on a version applies to no request.
+    bucket_name = get_new_bucket()
+    client = get_client()
+    check_configure_versioning_retry(bucket_name, "Enabled", "Enabled")
+    v1 = client.put_object(Bucket=bucket_name, Key='foo', Body='one')['VersionId']
+    v2 = client.put_object(Bucket=bucket_name, Key='foo', Body='two')['VersionId']
+    resource = "arn:aws:s3:::{}/*".format(bucket_name)
+    client.put_bucket_policy(Bucket=bucket_name, Policy=json.dumps(
+    {
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": ["s3:GetObjectVersion", "s3:DeleteObjectVersion"],
+            "Resource": resource,
+            "Condition": {"StringEquals": {"s3:VersionId": v1}}
+        }]
+    }))
+
+    def refused(fn, **kwargs):
+        e = assert_raises(ClientError, fn, **kwargs)
+        status, error_code = _get_status_and_error_code(e.response)
+        assert status == 403
+        assert error_code == 'AccessDenied'
+
+    try:
+        refused(client.get_object, Bucket=bucket_name, Key='foo', VersionId=v1)
+        assert _get_body(client.get_object(Bucket=bucket_name, Key='foo', VersionId=v2)) == 'two'
+        # A copy source header the GET has no use for does not hide its version.
+        headers = {'x-amz-copy-source': '{}/foo'.format(bucket_name)}
+        add_headers = (lambda **kwargs: kwargs['params']['headers'].update(headers))
+        client.meta.events.register('before-call.s3.GetObject', add_headers)
+        refused(client.get_object, Bucket=bucket_name, Key='foo', VersionId=v1)
+        client.meta.events.unregister('before-call.s3.GetObject', add_headers)
+        # A copy is checked on its source's version.
+        refused(client.copy_object, Bucket=bucket_name, Key='copy1',
+                CopySource={'Bucket': bucket_name, 'Key': 'foo', 'VersionId': v1})
+        client.copy_object(Bucket=bucket_name, Key='copy2', CopySource={'Bucket': bucket_name, 'Key': 'foo', 'VersionId': v2})
+        # A DeleteObjects key is checked on the version it names.
+        response = client.delete_objects(Bucket=bucket_name, Delete={'Objects': [{'Key': 'foo', 'VersionId': v1}]})
+        assert [(err['Key'], err['Code']) for err in response.get('Errors', [])] == [('foo', 'AccessDenied')]
+    finally:
+        # The Deny of s3:DeleteObjectVersion would keep the cleanup from
+        # removing v1.
+        client.delete_bucket_policy(Bucket=bucket_name)
+    assert _get_body(client.get_object(Bucket=bucket_name, Key='foo', VersionId=v1)) == 'one'
